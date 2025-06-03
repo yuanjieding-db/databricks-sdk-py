@@ -968,7 +968,7 @@ class MultipartUploadTestCase:
         ),
         # -------------------------- failures on "create upload URL" --------------------------
         MultipartUploadTestCase(
-            "Create upload URL: 400 response is not retied",
+            "Create upload URL: 400 response is not retried",
             stream_size=1024 * 1024,
             custom_response_on_create_multipart_url=CustomResponse(
                 code=400,
@@ -976,13 +976,6 @@ class MultipartUploadTestCase:
                 only_invocation=1,
             ),
             expected_exception_type=BadRequest,
-            expected_aborted=True,
-        ),
-        MultipartUploadTestCase(
-            "Create upload URL: 500 error is not retied",
-            stream_size=1024 * 1024,
-            custom_response_on_create_multipart_url=CustomResponse(code=500, only_invocation=1),
-            expected_exception_type=InternalError,
             expected_aborted=True,
         ),
         MultipartUploadTestCase(
@@ -1045,6 +1038,16 @@ class MultipartUploadTestCase:
             ),
             expected_aborted=False,
         ),
+        MultipartUploadTestCase(
+            "Create upload URL: intermittent retryable exception 3",
+            stream_size=1024 * 1024,
+            multipart_upload_chunk_size=10 * 1024 * 1024,
+            custom_response_on_create_multipart_url=CustomResponse(code=500,
+                first_invocation=4,
+                last_invocation=6,
+            ),
+            expected_aborted=False,
+        ),
         # -------------------------- failures on chunk upload --------------------------
         MultipartUploadTestCase(
             "Upload chunk: 403 response is not retried",
@@ -1068,14 +1071,6 @@ class MultipartUploadTestCase:
                 only_invocation=3,
             ),
             expected_exception_type=BadRequest,
-            expected_aborted=True,
-        ),
-        MultipartUploadTestCase(
-            "Upload chunk: 500 response is not retried",
-            stream_size=100 * 1024 * 1024,  # 10 chunks
-            multipart_upload_chunk_size=10 * 1024 * 1024,
-            custom_response_on_upload=CustomResponse(code=500, only_invocation=5),
-            expected_exception_type=InternalError,
             expected_aborted=True,
         ),
         MultipartUploadTestCase(
@@ -1159,45 +1154,44 @@ class MultipartUploadTestCase:
             expected_aborted=False,
         ),
         MultipartUploadTestCase(
-            "Upload chunk: intermittent retryable status code",
+            "Upload chunk: intermittent retryable status code 429",
             stream_size=100 * 1024 * 1024,  # 10 chunks
             multipart_upload_chunk_size=10 * 1024 * 1024,
             custom_response_on_upload=CustomResponse(code=429, first_invocation=2, last_invocation=4),
             expected_aborted=False,
         ),
-        # -------------------------- failures on abort --------------------------
         MultipartUploadTestCase(
-            "Abort URL: 500 response",
-            stream_size=1024 * 1024,
-            custom_response_on_create_multipart_url=CustomResponse(code=500, only_invocation=1),
-            custom_response_on_create_abort_url=CustomResponse(code=400),
-            expected_exception_type=InternalError,  # original error
-            expected_aborted=False,  # server state didn't change to record abort
+            "Upload chunk: intermittent retryable status code 500",
+            stream_size=100 * 1024 * 1024,  # 10 chunks
+            multipart_upload_chunk_size=10 * 1024 * 1024,
+            custom_response_on_upload=CustomResponse(code=500, first_invocation=2, last_invocation=4),
+            expected_aborted=False,
         ),
+        # -------------------------- failures on abort --------------------------
         MultipartUploadTestCase(
             "Abort URL: 403 response",
             stream_size=1024 * 1024,
-            custom_response_on_upload=CustomResponse(code=500, only_invocation=1),
+            custom_response_on_upload=CustomResponse(code=403, only_invocation=1),
             custom_response_on_create_abort_url=CustomResponse(code=403),
-            expected_exception_type=InternalError,  # original error
+            expected_exception_type=PermissionDenied,  # original error
             expected_aborted=False,  # server state didn't change to record abort
         ),
         MultipartUploadTestCase(
             "Abort URL: intermittent retryable error",
             stream_size=1024 * 1024,
-            custom_response_on_create_multipart_url=CustomResponse(code=500, only_invocation=1),
+            custom_response_on_create_multipart_url=CustomResponse(code=403, only_invocation=1),
             custom_response_on_create_abort_url=CustomResponse(code=429, first_invocation=1, last_invocation=3),
-            expected_exception_type=InternalError,  # original error
+            expected_exception_type=PermissionDenied,  # original error
             expected_aborted=True,  # abort successfully called after abort URL creation is retried
         ),
         MultipartUploadTestCase(
             "Abort URL: intermittent retryable error 2",
             stream_size=1024 * 1024,
-            custom_response_on_create_multipart_url=CustomResponse(code=500, only_invocation=1),
+            custom_response_on_create_multipart_url=CustomResponse(code=403, only_invocation=1),
             custom_response_on_create_abort_url=CustomResponse(
                 exception=requests.Timeout, first_invocation=1, last_invocation=3
             ),
-            expected_exception_type=InternalError,  # original error
+            expected_exception_type=PermissionDenied,  # original error
             expected_aborted=True,  # abort successfully called after abort URL creation is retried
         ),
         MultipartUploadTestCase(
@@ -1247,7 +1241,6 @@ class MultipartUploadTestCase:
 )
 def test_multipart_upload(config: Config, test_case: MultipartUploadTestCase):
     test_case.run(config)
-
 
 class SingleShotUploadState:
 
