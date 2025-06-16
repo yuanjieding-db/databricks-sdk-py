@@ -1,7 +1,7 @@
+from typing import Optional
 
 from databricks.sdk import WorkspaceClient, FilesAPI
 from io import BytesIO
-from typing import BinaryIO
 import random
 
 TEST_VOLUME = "/Volumes/yuanjie_ding/default/python_sdk_test"
@@ -129,7 +129,8 @@ def parallel_download(w: WorkspaceClient):
     print("Parallel download test passed successfully.")
 
 
-def parallel_upload(w: WorkspaceClient):
+def parallel_upload(w: WorkspaceClient, parallel_mode: Optional[str] = None):
+    print(f"Using parallel mode: {parallel_mode}")
     files_api = get_ext_files_api(w)
     file_path = f"{TEST_VOLUME}/test_parallel_upload.txt"
     local_file_path = "/tmp/test_parallel_upload.txt"
@@ -141,7 +142,7 @@ def parallel_upload(w: WorkspaceClient):
         f.write(content)
 
     # Upload the file using the new interface with parallel upload
-    files_api.upload(file_path, local_file_path, overwrite=True, use_parallel=True)
+    files_api.upload(file_path, local_file_path, overwrite=True, parallel_mode=parallel_mode)
 
     # Verify the upload
     downloaded_content = files_api.download(file_path).contents.read()
@@ -157,11 +158,11 @@ if __name__ == "__main__":
     # os.environ[ENV_NAME] = "true"
 
     w = WorkspaceClient()
-    print(f"Using {w.config.host}")
+    print(f"Using Workspace: {w.config.host}")
 
     # multipart_upload(w)
     # new_download_interface(w)
     # parallel_download(w)
     # range_download(w)
-    # parallel_upload(w)
-    single_and_multipart_upload(w)
+    parallel_upload(w, parallel_mode="multithreading")
+    # single_and_multipart_upload(w)

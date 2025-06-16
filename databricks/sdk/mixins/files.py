@@ -865,7 +865,7 @@ class FilesExt(files.FilesAPI):
         print("Download complete.")
 
 
-    def upload(self, file_path: str, contents: Union[str,BinaryIO], *, overwrite: Optional[bool] = None, use_parallel: bool = False, parallelism: Optional[int]=None):
+    def upload(self, file_path: str, contents: Union[str,BinaryIO], *, overwrite: Optional[bool] = None, parallel_mode: Optional[str] = None, parallelism: Optional[int]=None):
         """Upload a file.
 
         Uploads a file. The file contents should be sent as the request body as raw bytes (an
@@ -881,7 +881,7 @@ class FilesExt(files.FilesAPI):
         """
 
         # Upload empty and small files with one-shot upload.
-        if not use_parallel:
+        if not parallel_mode or parallel_mode not in ("multithreading", "multiprocessing", "subprocess"):
             pre_read_buffer = contents.read(self._config.multipart_upload_min_stream_size)
             if len(pre_read_buffer) < self._config.multipart_upload_min_stream_size:
                 _LOG.debug(
@@ -905,11 +905,18 @@ class FilesExt(files.FilesAPI):
                 raise ValueError(f"Unexpected server response: {initiate_upload_response}")
 
             try:
-                if use_parallel:
+                if parallel_mode == "multiprocessing":
                     # check if content is str
                     if not isinstance(contents, str):
                         raise TypeError(f"contents must be a str when use_parallel is True, got {type(contents)}")
                     self._perform_parallel_multipart_upload_using_multiprocessing(
+                        file_path, contents, session_token, parallelism
+                    )
+                elif parallel_mode == "multithreading":
+                    # check if content is str
+                    if not isinstance(contents, str):
+                        raise TypeError(f"contents must be a str when use_parallel is True, got {type(contents)}")
+                    self._perform_parallel_multipart_upload_using_multithreading(
                         file_path, contents, session_token, parallelism
                     )
                 else:
@@ -1104,9 +1111,6 @@ class FilesExt(files.FilesAPI):
         current_part_number = 1
         etags: dict = {}
 
-        chunk_offset = 0  # used only for logging
-        retry_count = 0
-
         if parallelism is None:
             # default parallelism is set to cpu number
             parallelism = (os.cpu_count() - 1) or 1
@@ -1133,6 +1137,70 @@ class FilesExt(files.FilesAPI):
 
             for part_index, future in enumerate(futures, 1):
                 etag = future.get()
+                etags[current_part_number] = etag
+                current_part_number += 1
+
+        query = {"action": "complete-upload", "upload_type": "multipart", "session_token": session_token}
+        headers = {"Content-Type": "application/json"}
+        body: dict = {}
+
+        parts = []
+        for part_number, etag in sorted(etags.items()):
+            part = {"part_number": part_number, "etag": etag}
+            parts.append(part)
+
+        body["parts"] = parts
+
+        self._api.do(
+            "POST",
+            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(target_path)}",
+            query=query,
+            headers=headers,
+            body=body,
+        )
+
+    def _perform_parallel_multipart_upload_using_multithreading(
+        self,
+        target_path: str,
+        input_file_path: str,
+        session_token: str,
+        parallelism : Optional[int] = None
+    ):
+        """
+        Performs multipart upload using presigned URLs on AWS and Azure with multithreading.
+        """
+        # This method is a placeholder for future implementation of parallel multipart upload.
+        current_part_number = 1
+        etags: dict = {}
+
+        if parallelism is None:
+            # default parallelism is set to cpu number
+            parallelism = (os.cpu_count() - 1) or 1
+
+        file_size = os.path.getsize(input_file_path)
+
+        chunk_size = self._config.multipart_upload_chunk_size
+        num_parts = (file_size + chunk_size - 1) // chunk_size
+
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = []
+            for part_index in range(1, num_parts + 1):
+                chunk_offset = (part_index - 1) * chunk_size
+                chunk_size = min(chunk_size, file_size - chunk_offset)
+                futures.append(
+                    executor.submit(
+                        self.do_upload_one_chunk,
+                        target_path,
+                        input_file_path,
+                        part_index,
+                        chunk_offset,
+                        chunk_size,
+                        session_token
+                    )
+                )
+
+            for part_index, future in enumerate(futures, 1):
+                etag = future.result()
                 etags[current_part_number] = etag
                 current_part_number += 1
 

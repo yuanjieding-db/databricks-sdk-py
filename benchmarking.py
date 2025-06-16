@@ -103,6 +103,7 @@ def single_run(
         catalog_name: str,
         schema_name: str,
         volume_name: str,
+        parallel_mode: str,
         parallelism: int,
         chunk_size: Optional[int],
         file_size: Optional[int] = None,
@@ -159,7 +160,7 @@ def single_run(
     try:
         # upload file
         if parallelism is not None and parallelism > 1:
-            w.files.upload(target_remote_path, source_local_path, parallelism=parallelism, overwrite=True, use_parallel=True)
+            w.files.upload(target_remote_path, source_local_path, parallel_mode=parallel_mode, parallelism=parallelism, overwrite=True)
         else:
             with open(source_local_path, "rb") as input_stream:
                 # this will upload the file in chunks
@@ -199,6 +200,7 @@ def single_run(
             files_api_class(w),
             file_size,
             w.files._config.multipart_upload_chunk_size if files_api_class(w) == "FilesExt" else "0",
+            parallel_mode,
             parallelism,
             upload_duration_s,
             create_upload_parts_count,
@@ -237,6 +239,7 @@ def run_series(
         pbar,
         csv_writer: csv.writer,
         runs_count: int,
+        parallel_mode: str,
         parallelism: int,
         file_size: int,
         chunk_size: Optional[int],
@@ -257,6 +260,7 @@ def run_series(
                     catalog_name=catalog_name,
                     schema_name=schema_name,
                     volume_name=volume_name,
+                    parallel_mode=parallel_mode,
                     parallelism=parallelism,
                     chunk_size=chunk_size,
                     file_size=None,
@@ -341,13 +345,18 @@ def main():
 
     parallel_params = get_parallelism_params(system_cpu_cnt - 1)
 
+    parallel_modes = [
+        "multithreading",
+        "multiprocessing",
+    ]
+
     file_sizes = [
         1 * 1024 * 1024,
-        10 * 1024 * 1024,
-        100 * 1024 * 1024,
-        500 * 1024 * 1024,
-        1024 * 1024 * 1024,
-        4 * 1024 * 1024 * 1024,
+        # 10 * 1024 * 1024,
+        # 100 * 1024 * 1024,
+        # 500 * 1024 * 1024,
+        # 1024 * 1024 * 1024,
+        # 4 * 1024 * 1024 * 1024,
     ]
 
     multipart_upload_chunk_sizes = [
@@ -359,11 +368,13 @@ def main():
     print(f"Will be uploading to {w.config.host}, Volume: {catalog_name}/{schema_name}/{volume_name}")
     print(f"Will be running {runs_count} runs for each file size")
     print(f"Will be running with {system_cpu_cnt} system CPUs, parallelism values: {parallel_params}")
+    print(f"Will be running upload with parallel modes: {parallel_modes}")
 
     columns = [
         "files_api_client",
         "file_size",
         "chunk_size",
+        "parallel_mode",
         "parallelism",
         "upload_time_s",
         "create_upload_part_urls_count",
@@ -376,7 +387,7 @@ def main():
     # print(",".join(columns))
 
     from tqdm import tqdm
-    runs_per_file_size = len(multipart_upload_chunk_sizes) * len(parallel_params) * runs_count
+    runs_per_file_size = len(multipart_upload_chunk_sizes) * len(parallel_params) * len(parallel_modes) * runs_count
     total_size = sum(file_sizes) * runs_per_file_size
     counter_pbar = tqdm(total=len(file_sizes) * runs_per_file_size, desc="Runs progress")
     with tqdm(total=total_size, unit="B", unit_scale=True, desc="Upload Data progress", position=1, leave=False) as pbar:
@@ -385,20 +396,22 @@ def main():
             csv_writer.writerow(columns)
             for file_size in file_sizes:
                 for chunk_size in multipart_upload_chunk_sizes:
-                    for parallelism in parallel_params:
-                        run_series(
-                            w=w,
-                            counter_pbar=counter_pbar,
-                            pbar=pbar,
-                            csv_writer=csv_writer,
-                            runs_count=runs_count,
-                            parallelism=parallelism,
-                            file_size=file_size,
-                            chunk_size=chunk_size,
-                            catalog_name=catalog_name,
-                            schema_name=schema_name,
-                            volume_name=volume_name)
-                        f.flush()
+                    for parallel_mode in parallel_modes:
+                        for parallelism in parallel_params:
+                            run_series(
+                                w=w,
+                                counter_pbar=counter_pbar,
+                                pbar=pbar,
+                                csv_writer=csv_writer,
+                                runs_count=runs_count,
+                                parallel_mode=parallel_mode,
+                                parallelism=parallelism,
+                                file_size=file_size,
+                                chunk_size=chunk_size,
+                                catalog_name=catalog_name,
+                                schema_name=schema_name,
+                                volume_name=volume_name)
+                            f.flush()
 
 
 if __name__ == "__main__":
