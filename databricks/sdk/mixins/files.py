@@ -11,6 +11,8 @@ import re
 import shutil
 import sys
 import threading
+import subprocess
+import json
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 import multiprocessing
@@ -919,6 +921,12 @@ class FilesExt(files.FilesAPI):
                     self._perform_parallel_multipart_upload_using_multithreading(
                         file_path, contents, session_token, parallelism
                     )
+                elif parallel_mode == "subprocess":
+                    if not isinstance(contents, str):
+                        raise TypeError(f"contents must be a str when use_parallel is True, got {type(contents)}")
+                    self._perform_parallel_multipart_upload_using_subprocess(
+                        file_path, contents, session_token, parallelism
+                    )
                 else:
                     self._perform_multipart_upload(
                         file_path, contents, session_token, pre_read_buffer, cloud_provider_session
@@ -1089,6 +1097,82 @@ class FilesExt(files.FilesAPI):
 
         # Completing upload is an idempotent operation, safe to retry.
         # Method _api.do() takes care of retrying and will raise an exception in case of failure.
+        self._api.do(
+            "POST",
+            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(target_path)}",
+            query=query,
+            headers=headers,
+            body=body,
+        )
+
+    def _perform_parallel_multipart_upload_using_subprocess(
+            self,
+            target_path: str,
+            input_file_path: str,
+            session_token: str,
+            parallelism: Optional[int] = None
+    ):
+        """
+        Performs multipart upload using presigned URLs with subprocess-based parallelism.
+        """
+        current_part_number = 1
+        etags: dict = {}
+
+        if parallelism is None:
+            parallelism = (os.cpu_count() - 1) or 1
+
+        file_size = os.path.getsize(input_file_path)
+        chunk_size = self._config.multipart_upload_chunk_size
+        num_parts = (file_size + chunk_size - 1) // chunk_size
+
+        # Limit subprocesses to parallelism value
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from databricks.sdk.mixins import upload_chunk
+
+        upload_script_path = upload_chunk.__file__
+
+        def run_upload_subprocess(part_index):
+            chunk_offset = (part_index - 1) * chunk_size
+            current_chunk_size = min(chunk_size, file_size - chunk_offset)
+
+            result = subprocess.run(
+                [
+                    sys.executable, upload_script_path,
+                    target_path,
+                    input_file_path,
+                    str(part_index),
+                    str(chunk_offset),
+                    str(current_chunk_size),
+                    session_token
+                ],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Upload subprocess failed: {result.stderr.strip()}")
+
+            try:
+                last_line = next(
+                    line for line in reversed(result.stdout.strip().splitlines()) if line.strip()
+                )
+                parsed = json.loads(last_line)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse output from subprocess for chunk {part_index}: {e}")
+            return parsed["part_index"], parsed["etag"]
+
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = [executor.submit(run_upload_subprocess, i) for i in range(1, num_parts + 1)]
+            for future in as_completed(futures):
+                part_index, etag = future.result()
+                etags[part_index] = etag
+
+        query = {"action": "complete-upload", "upload_type": "multipart", "session_token": session_token}
+        headers = {"Content-Type": "application/json"}
+        body: dict = {
+            "parts": [{"part_number": part_number, "etag": etag} for part_number, etag in sorted(etags.items())]
+        }
+
         self._api.do(
             "POST",
             f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(target_path)}",

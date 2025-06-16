@@ -346,17 +346,20 @@ def main():
     parallel_params = get_parallelism_params(system_cpu_cnt - 1)
 
     parallel_modes = [
-        "multithreading",
-        "multiprocessing",
+        # "multithreading",
+        # "multiprocessing",
+        "subprocess",
     ]
 
     file_sizes = [
         1 * 1024 * 1024,
-        # 10 * 1024 * 1024,
+        10 * 1024 * 1024,
         # 100 * 1024 * 1024,
         # 500 * 1024 * 1024,
         # 1024 * 1024 * 1024,
         # 4 * 1024 * 1024 * 1024,
+        # 10 * 1024 * 1024 * 1024,
+        # 20 * 1024 * 1024 * 1024,
     ]
 
     multipart_upload_chunk_sizes = [

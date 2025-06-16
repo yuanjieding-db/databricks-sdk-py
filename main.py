@@ -154,8 +154,8 @@ ENV_NAME = 'DATABRICKS_ENABLE_EXPERIMENTAL_FILES_API_CLIENT'
 if __name__ == "__main__":
     # Create a WorkspaceClient instance
 
-    # import os
-    # os.environ[ENV_NAME] = "true"
+    import os
+    os.environ[ENV_NAME] = "true"
 
     w = WorkspaceClient()
     print(f"Using Workspace: {w.config.host}")
@@ -164,5 +164,5 @@ if __name__ == "__main__":
     # new_download_interface(w)
     # parallel_download(w)
     # range_download(w)
-    parallel_upload(w, parallel_mode="multithreading")
+    parallel_upload(w, parallel_mode="subprocess")
     # single_and_multipart_upload(w)
