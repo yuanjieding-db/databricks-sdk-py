@@ -1,5 +1,3 @@
-from email.feedparser import headerRE
-from os import remove
 
 from databricks.sdk import WorkspaceClient, FilesAPI
 from io import BytesIO
@@ -28,7 +26,7 @@ def get_content(size: int, version: int) -> bytes:
     return bytes(rnd.getrandbits(8) for _ in range(size))
 
 def multipart_upload(w: WorkspaceClient):
-    file_path = f"{TEST_VOLUME}/multipart.txt"
+    file_path = f"{TEST_VOLUME}/test_single_multipart.txt"
     files_api = get_ext_files_api(w)
     content_size = 10 * 1024 * 1024  # 10 MB
     content = BytesIO(get_content(content_size, 0))
@@ -38,6 +36,28 @@ def multipart_upload(w: WorkspaceClient):
     assert len(result_content) == content_size, f"Expected {content_size} bytes, got {len(result_content)} bytes"
     assert result_content == get_content(content_size, 0), "Content mismatch after upload"
     print(f"Successfully uploaded and verified {file_path} with size {content_size} bytes.")
+
+def single_and_multipart_upload(w: WorkspaceClient):
+    single_part_files_api = w.files
+    multipart_files_api = get_ext_files_api(w)
+
+    file_path = f"{TEST_VOLUME}/test_single_multipart.txt"
+    content_size = 10 * 1024 * 1024  # 10 MB
+    content_bytes = get_content(content_size, 0)
+    content = BytesIO(content_bytes)
+
+    # Single part upload
+    single_part_files_api.upload(file_path, content, overwrite=True)
+    downloaded_content_single = single_part_files_api.download(file_path).contents.read()
+    assert downloaded_content_single == content_bytes, "Single part upload content mismatch"
+    print("Single part upload test passed successfully.")
+
+    # Multipart upload
+    content = BytesIO(get_content(content_size, 1))
+    multipart_files_api.upload(file_path, content, overwrite=True)
+    downloaded_content_multipart = multipart_files_api.download(file_path).contents.read()
+    assert downloaded_content_multipart == get_content(content_size, 1), "Multipart upload content mismatch"
+    print("Multi part upload test passed successfully.")
 
 def new_download_interface(w: WorkspaceClient):
     files_api = get_ext_files_api(w)
@@ -133,8 +153,8 @@ ENV_NAME = 'DATABRICKS_ENABLE_EXPERIMENTAL_FILES_API_CLIENT'
 if __name__ == "__main__":
     # Create a WorkspaceClient instance
 
-    import os
-    os.environ[ENV_NAME] = "true"
+    # import os
+    # os.environ[ENV_NAME] = "true"
 
     w = WorkspaceClient()
     print(f"Using {w.config.host}")
@@ -143,4 +163,5 @@ if __name__ == "__main__":
     # new_download_interface(w)
     # parallel_download(w)
     # range_download(w)
-    parallel_upload(w)
+    # parallel_upload(w)
+    single_and_multipart_upload(w)
