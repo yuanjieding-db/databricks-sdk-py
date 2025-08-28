@@ -3,44 +3,42 @@ from __future__ import annotations
 import base64
 import datetime
 import logging
-import io
+import math
 import os
 import pathlib
 import platform
 import re
 import shutil
 import sys
-import threading
-import subprocess
-import json
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
-import multiprocessing
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import timedelta
 from io import BytesIO
+from queue import Queue, Empty
+from tempfile import NamedTemporaryFile
+from threading import Thread, Event
 from types import TracebackType
-from typing import (TYPE_CHECKING, AnyStr, BinaryIO, Callable, Generator,
-                    Iterable, Optional, Type, Union)
+from typing import TYPE_CHECKING, AnyStr, BinaryIO, Callable, Generator, Iterable, Optional, Type, Union, Any
 from urllib import parse
 
 import requests
 import requests.adapters
 from requests import RequestException
-import databricks.sdk.core as client
 
 from .._base_client import _BaseClient, _RawResponse, _StreamingResponse
 from .._property import _cached_property
 from ..config import Config
-from ..errors import AlreadyExists, NotFound
-from ..errors.customizer import _RetryAfterCustomizer
+from ..errors import AlreadyExists, NotFound, PermissionDenied
 from ..errors.mapper import _error_mapper
 from ..retries import retried
 from ..service import files
 from ..service._internal import _escape_multi_segment_path_parameter
 from ..service.files import DownloadResponse
+
+from .files_utils import _ConcatenatedInputStream
 
 if TYPE_CHECKING:
     from _typeshed import Self
@@ -583,32 +581,27 @@ class _DbfsPath(_Path):
     def __repr__(self) -> str:
         return f"<_DbfsPath {self._path}>"
 
+
 class _RetryableException(Exception):
     """Base class for retryable exceptions in DBFS operations."""
 
-    def __init__(self, message: str, *, http_status_code: Optional[int] = None, retry_after_sec: Optional[int] = None):
+    def __init__(self, message: str, http_status_code: int):
         super().__init__()
         self.message = message
         self.http_status_code = http_status_code
-        self.retry_after_sec = retry_after_sec
 
-    def __str__(self):
-        return f"{self.message} (HTTP Status: {self.http_status_code}, Retry After: {self.retry_after_sec} seconds)"
+    def __str__(self) -> str:
+        return f"{self.message} (HTTP Status: {self.http_status_code})"
 
     @staticmethod
-    def make_error(response: requests.Response):
+    def make_error(response: requests.Response) -> "_RetryableException":
         """Map the response to a retryable exception."""
-        retry_after = response.headers.get("Retry-After", None)
-        try:
-            retry_after = int(retry_after) if retry_after else None
-        except ValueError:
-            retry_after = None
 
         return _RetryableException(
             message=response.text,
             http_status_code=response.status_code,
-            retry_after_sec=retry_after
         )
+
 
 class DbfsExt(files.DbfsAPI):
     __doc__ = files.DbfsAPI.__doc__
@@ -723,18 +716,84 @@ class DbfsExt(files.DbfsAPI):
         p.delete(recursive=recursive)
 
 
+class FallbackToUploadUsingFilesApi(Exception):
+    """Custom exception that signals to fallback to FilesAPI"""
+
+    def __init__(self, buffer, message):
+        super().__init__(message)
+        self.buffer = buffer
+
+
+@dataclass
+class CreateDownloadUrlResponse:
+    """Response from the download URL API call."""
+
+    url: Optional[str] = None
+    """The presigned URL to download the file."""
+    headers: Optional[dict[str, str]] = None
+    """Headers to use when making the download request."""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CreateDownloadUrlResponse:
+        """Create an instance from a dictionary."""
+        if "url" not in data:
+            raise ValueError("Missing 'url' in response data")
+        return cls(url=data["url"], headers=data.get("headers", {}))
+
+
+@dataclass
+class UploadStreamResult:
+    """Result of an upload from stream operation. Currently empty, but can be extended in the future."""
+
+    pass
+
+
+@dataclass
+class UploadFileResult:
+    """Result of an upload from file operation. Currently empty, but can be extended in the future."""
+
+    pass
+
+@dataclass
+class DownloadFileResult:
+    """Result of a download to file operation. Currently empty, but can be extended in the future."""
+
+    pass
+
+
 class FilesExt(files.FilesAPI):
     __doc__ = files.FilesAPI.__doc__
 
     # note that these error codes are retryable only for idempotent operations
-    _RETRYABLE_STATUS_CODES = [408, 429, 500, 502, 503, 504]
+    _RETRYABLE_STATUS_CODES: list[int] = [408, 429, 500, 502, 503, 504]
+
+    @dataclass
+    class _UploadContext:
+        target_path: str
+        """The absolute remote path of the target file, e.g. /Volumes/path/to/your/file."""
+        overwrite: Optional[bool]
+        """If true, an existing file will be overwritten. When unspecified, default behavior of the cloud storage provider is performed."""
+        part_size: int
+        """The size of each part in bytes for multipart upload."""
+        batch_size: int
+        """The number of urls to request in a single batch."""
+        content_length: Optional[int] = None
+        """The total size of the content being uploaded, if known."""
+        source_file_path: Optional[str] = None
+        """The local path of the file being uploaded, if applicable."""
+        use_parallel: Optional[bool] = None
+        """If true, the upload will be performed using multiple threads."""
+        parallelism: Optional[int] = None
 
     def __init__(self, api_client, config: Config):
         super().__init__(api_client)
         self._config = config.copy()
         self._multipart_upload_read_ahead_bytes = 1
 
-    def download(self, file_path: str, *, destination: Optional[Union[str, BinaryIO]] = None, parallel: Optional[bool] = False) -> DownloadResponse:
+    def download(
+        self,
+        file_path: str,
+    ) -> DownloadResponse:
         """Download a file.
 
         Downloads a file of any size. The file contents are the response body.
@@ -750,155 +809,313 @@ class FilesExt(files.FilesAPI):
         :returns: :class:`DownloadResponse`
         """
 
-        if destination is None:
-            # Download to a byte stream
-            return self._download_to_byte_stream(file_path)
-        if isinstance(destination, str):
-            # Download to a local file
-            destination_path = pathlib.Path(destination)
-            destination_path.parent.mkdir(parents=True, exist_ok=True)
-            with destination_path.open("wb") as f:
-                response = self._open_download_stream(
-                    file_path=file_path,
-                    start_byte_offset=0,
-                    if_unmodified_since_timestamp=None,
-                )
-                shutil.copyfileobj(response.contents, f)
-            return DownloadResponse(
-                contents=None,
-                content_length=response.content_length,
-                content_type=response.content_type,
-                last_modified=response.last_modified,
-            )
-        if isinstance(destination, io.IOBase) and destination.writable():
-            # Download to a writable BinaryIO
-            response = self._open_download_stream(
-                file_path=file_path,
-                start_byte_offset=0,
-                if_unmodified_since_timestamp=None,
-            )
-            shutil.copyfileobj(response.contents, destination)
-            return DownloadResponse(
-                contents=None,
-                content_length=response.content_length,
-                content_type=response.content_type,
-                last_modified=response.last_modified,
-            )
-        raise TypeError(f"destination type {type(destination)} not supported")
-
-    def _download_to_byte_stream(self, file_path: str) -> DownloadResponse:
         initial_response: DownloadResponse = self._open_download_stream(
-            file_path=file_path,
-            start_byte_offset=0,
-            if_unmodified_since_timestamp=None,
+            file_path=file_path, start_byte_offset=0, if_unmodified_since_timestamp=None
         )
 
         wrapped_response = self._wrap_stream(file_path, initial_response)
         initial_response.contents._response = wrapped_response
         return initial_response
 
-    def _parallel_download(self, file_path: str, destination: str, num_threads: int = 4) -> DownloadResponse:
-        head_response = self._head_download(file_path)
-        total_size = head_response.content_length
-        last_modified = head_response.last_modified
-        print(f"Downloading {total_size} bytes from {file_path}, last modified at {last_modified}")
+    def download_to(
+        self,
+        file_path: str,
+        destination: str,
+        *,
+        overwrite: bool = True,
+        use_parallel: bool = False,
+        parallelism: Optional[int] = None,
+    ) -> DownloadFileResult:
+        """Download a file to a local path. There would be no responses returned if the download is successful.
 
-        if total_size is None:
-            raise ValueError("Could not determine file size for parallel download.")
+        :param file_path: str
+          The remote path of the file, e.g. /Volumes/path/to/your/file
+        :param destination: str
+          The local path where the file will be saved.
+        :param overwrite: bool
+          If true, an existing file will be overwritten. When not specified, assumed True.
+        :param use_parallel: bool
+          If true, the download will be performed using multiple threads.
+        :param parallelism: int
+          The number of parallel threads to use for downloading. If not specified, defaults to the number of CPU cores.
 
-        chunk_size = total_size // num_threads
-        error_event = threading.Event()
-        exception_holder = []
+        :returns: :class:`DownloadFileResult`
+        """
+        # if response.contents
+        if use_parallel:
+            if parallelism is None:
+                parallelism = os.cpu_count()
+            if parallelism < 1 or parallelism > 64:
+                raise ValueError("parallelism must be between 1 and 64")
+            self._parallel_download(file_path, destination, overwrite=overwrite, parallelism=parallelism)
+        else:
+            if overwrite:
+                open_mode = "wb"
+            else:
+                open_mode = "xb"
+            with open(destination, open_mode) as f:
+                response = self.download(file_path)
+                shutil.copyfileobj(response.contents, f)
+        return DownloadFileResult()
 
-        def download_chunk(index: int, start: int, end: int):
-            print("downloading chunk", index, "from", start, "to", end)
-            current_start = start
-            while current_start <= end:
-                if error_event.is_set():
-                    return
-                try:
-                    response = self._open_download_stream(
-                        file_path,
-                        start_byte_offset=current_start,
-                        end_byte_offset=end,
-                        if_unmodified_since_timestamp=last_modified
-                    )
-                    expected_length = end - current_start + 1
-                    actual_length = response.content_length or 0
+    def _parallel_download(self, file_path: str, destination: str, overwrite: bool, parallelism: int) -> None:
+        """Download a file in parallel to a local path. There would be no responses returned if the download is successful.
 
-                    if actual_length == 0:
-                        raise ValueError(f"Received zero bytes when trying to download from {current_start} to {end}.")
-                    if actual_length > expected_length:
-                        raise ValueError(f"Chunk size mismatch: expected max {expected_length}, got {actual_length}.")
+        :param file_path: str
+          The remote path of the file, e.g. /Volumes/path/to/your/file
+        :param destination: str
+          The local path where the file will be saved.
+        :param overwrite: bool
+          If true, an existing file will be overwritten. When not specified, assumed True.
+        :param parallelism: int
+          The number of parallel threads to use for downloading.
 
-                    data = response.contents.read() if response.contents else b""
-                    with open(destination, 'r+b') as f:
-                        f.seek(current_start)
-                        f.write(data)
+        :returns: None
+        """
+        if not overwrite and os.path.exists(destination):
+            raise FileExistsError(destination)
 
-                    if actual_length < expected_length:
-                        current_start += actual_length
-                    else:
-                        break
+        # Get the file size
+        file_info = self.get_metadata(file_path)
+        file_size = file_info.content_length
 
-                except Exception as e:
-                    print(f"Error downloading chunk {index} from {current_start} to {end}: {e}")
-                    error_event.set()
-                    exception_holder.append(e)
-                    return
+        # Calculate the chunk size for each thread
+        part_size = math.ceil(file_size / parallelism)
 
-        with open(destination, 'wb') as f:
-            f.truncate(total_size)
+        # Create a list to hold the threads
+        threads = []
+        # Create a list to hold the exceptions from threads
+        exceptions = []
+        results = []
 
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = []
-            for i in range(num_threads):
-                start = i * chunk_size
-                end = (start + chunk_size - 1) if i < num_threads - 1 else total_size - 1
-                futures.append(executor.submit(download_chunk, i, start, end))
+        def download_chunk(start: int, end: int, index: int):
+            try:
+                response = self._open_download_stream(
+                    file_path=file_path,
+                    start_byte_offset=start,
+                    end_byte_offset=end,
+                    if_unmodified_since_timestamp=file_info.last_modified,
+                )
+                wrapped_response = self._wrap_stream(file_path, response, start, end)
+                response.contents._response = wrapped_response
+                with NamedTemporaryFile(delete=False, mode="wb") as f:
+                    shutil.copyfileobj(response.contents, f)
+                    results.append((index, f.name))
+            except Exception as e:
+                exceptions.append(e)
 
-            for future in as_completed(futures):
-                if error_event.is_set():
-                    break
+        # Start the threads to download chunks
+        for i in range(parallelism):
+            start = i * part_size
+            end = min(start + part_size - 1, file_size - 1)
+            thread = Thread(target=download_chunk, args=(start, end, i))
+            thread.start()
+            threads.append(thread)
 
-        if exception_holder:
-            raise RuntimeError(f"Download failed: {exception_holder[0]}")
+        # Wait for all threads to complete
 
-        print("Download complete.")
+        for thread in threads:
+            thread.join()
 
+        # If there were any exceptions, raise the first one
+        if len(exceptions) > 0:
+            for result in results:
+                os.remove(result[1])
+            raise exceptions[0]
 
-    def upload(self, file_path: str, contents: Union[str,BinaryIO], *, overwrite: Optional[bool] = None, parallel_mode: Optional[str] = None, parallelism: Optional[int]=None):
-        """Upload a file.
+        # move the temp file to the destination
+        with open(destination, "wb") as dest_file:
+            for index, temp_file in sorted(results, key=lambda x: x[0]):
+                with open(temp_file, "rb") as src_file:
+                    shutil.copyfileobj(src_file, dest_file)
+                os.remove(temp_file)
 
-        Uploads a file. The file contents should be sent as the request body as raw bytes (an
-        octet stream); do not encode or otherwise modify the bytes before sending. The contents of the
-        resulting file will be exactly the bytes sent in the request body. If the request is successful, there
-        is no response body.
+    def _get_optimized_performance_parameters(
+        self, ctx: _UploadContext, part_size_overwrite: Optional[int]
+    ) -> (Optional[int], Optional[int]):
+        chosen_part_size = None
+        chosen_batch_size = None
+
+        # 1. decide on the part size
+        if part_size_overwrite is not None:  # If a part size is provided, we use it directly after validation.
+            if part_size_overwrite > self._config.multipart_upload_max_part_size:
+                raise ValueError(
+                    f"Part size {part_size_overwrite} exceeds maximum allowed size {self._config.multipart_upload_max_part_size} bytes."
+                )
+            chosen_part_size = part_size_overwrite
+            _LOG.debug(f"Using provided part size: {chosen_part_size} bytes")
+        else:  # If no part size is provided, we will optimize based on the content length.
+            if ctx.content_length is not None:
+                # Choosing the smallest part size that allows for a maximum of 100 parts.
+                for part_size in self._config.multipart_upload_part_size_options:
+                    part_num = (ctx.content_length + part_size - 1) // part_size
+                    if part_num <= 100:
+                        chosen_part_size = part_size
+                        _LOG.debug(
+                            f"Optimized part size for upload: {chosen_part_size} bytes for content length {ctx.content_length} bytes"
+                        )
+                if chosen_part_size is None:  # If no part size was chosen, we default to the maximum allowed part size.
+                    chosen_part_size = self._config.multipart_upload_max_part_size
+
+        # 2. decide on the batch size
+        if chosen_part_size is not None:
+            part_num = (ctx.content_length + chosen_part_size - 1) // chosen_part_size
+            chosen_batch_size = int(
+                math.ceil(math.sqrt(part_num))
+            )  # Using the square root of the number of parts as a heuristic for batch size.
+        else:
+            chosen_batch_size = 10
+
+        return chosen_part_size, chosen_batch_size
+
+    def _optimize_context_parameters(self, ctx: _UploadContext, part_size_overwrite: Optional[int]) -> None:
+        """Optimize the upload context parameters based on the content length and provided part size."""
+
+        # Get optimized part size and batch size
+        optimized_part_size, optimized_batch_size = self._get_optimized_performance_parameters(ctx, part_size_overwrite)
+        if optimized_part_size is not None:
+            ctx.part_size = optimized_part_size
+        if optimized_batch_size is not None:
+            ctx.batch_size = optimized_batch_size
+        _LOG.debug(f"Optimized upload context: part_size={ctx.part_size}, batch_size={ctx.batch_size}")
+
+    def upload(
+        self, file_path: str, content: BinaryIO, *, overwrite: Optional[bool] = None, part_size: Optional[int] = None
+    ) -> UploadStreamResult:
+        """
+        Upload a file with stream interface.
+
+        :param file_path: str
+            The absolute remote path of the target file, e.g. /Volumes/path/to/your/file
+        :param content: BinaryIO
+            The contents of the file to upload. This must be a BinaryIO stream.
+        :param overwrite: bool (optional)
+            If true, an existing file will be overwritten. When not specified, assumed True.
+        :param part_size: int (optional)
+            If set, multipart upload will use the value as its size per uploading part.
+
+        :returns: :class:`UploadStreamResult`
+        """
+
+        _LOG.debug(f"Uploading file from BinaryIO stream")
+        # If the content is a BinaryIO stream, we can determine if it is seekable or not.
+        ctx = self._UploadContext(
+            file_path,
+            overwrite,
+            self._config.multipart_upload_default_part_size,
+            self._config.multipart_upload_batch_url_count,
+        )
+        # Set the content length if it is known.
+        if content.seekable():
+            # If the stream is seekable, we can read its size.
+            content.seek(0, os.SEEK_END)
+            file_size = content.tell()
+            content.seek(0)
+            ctx.content_length = file_size
+
+        self._optimize_context_parameters(ctx, part_size)
+        if ctx.content_length is not None:
+            self._upload_single_thread_with_known_size(ctx, content)
+            return UploadStreamResult()
+        else:
+            _LOG.debug(f"Uploading using non-seekable mode")
+            # If the stream is not seekable, we cannot determine its size.
+            # We will use a multipart upload.
+            _LOG.debug(f"Using multipart upload for non-seekable input stream of unknown size for file {file_path}")
+            self._single_thread_multipart_upload(ctx, content)
+            return UploadStreamResult()
+
+    def upload_from(
+        self,
+        file_path: str,
+        source_path: str,
+        *,
+        overwrite: Optional[bool] = None,
+        part_size: Optional[int] = None,
+        use_parallel: bool = False,
+        parallelism: Optional[int] = None,
+    ) -> UploadFileResult:
+        """Upload a file directly from a local path.
 
         :param file_path: str
           The absolute remote path of the target file.
-        :param contents: BinaryIO
+        :param source_path: str
+          The local path of the file to upload. This must be a path to a local file.
+        :param part_size: int
+          The size of each part in bytes for multipart upload. This is a required parameter for multipart uploads.
         :param overwrite: bool (optional)
           If true, an existing file will be overwritten. When not specified, assumed True.
+        :param use_parallel: bool (optional)
+          If true, the upload will be performed using multiple threads.
+        :param parallelism: int (optional)
+          The number of threads to use for parallel uploads. This is only used if `use_parallel` is True.
+          If not specified, the default parallelism will be used based on the configuration.
+
+        :returns: :class:`UploadFileResult`
         """
 
-        # Upload empty and small files with one-shot upload.
-        if not parallel_mode or parallel_mode not in ("multithreading", "multiprocessing", "subprocess"):
-            pre_read_buffer = contents.read(self._config.multipart_upload_min_stream_size)
-            if len(pre_read_buffer) < self._config.multipart_upload_min_stream_size:
-                _LOG.debug(
-                    f"Using one-shot upload for input stream of size {len(pre_read_buffer)} below {self._config.multipart_upload_min_stream_size} bytes"
-                )
-                return super().upload(file_path=file_path, contents=BytesIO(pre_read_buffer), overwrite=overwrite)
+        _LOG.debug(f"Uploading file from local path: {source_path}")
+        if parallelism is not None and not use_parallel:
+            raise ValueError("parallelism can only be set if use_parallel is True")
+        # If the content is a string, it is a path to a local file.
+        file_size = os.path.getsize(source_path)
+        ctx = self._UploadContext(
+            file_path,
+            overwrite,
+            self._config.multipart_upload_default_part_size,
+            self._config.multipart_upload_batch_url_count,
+            content_length=file_size,
+            source_file_path=source_path,
+            use_parallel=use_parallel,
+            parallelism=parallelism,
+        )
+        self._optimize_context_parameters(ctx, part_size)
+        if ctx.use_parallel:
+            self._parallel_upload(ctx)
+            return UploadFileResult()
+        else:
+            with open(source_path, "rb") as f:
+                self._upload_single_thread_with_known_size(ctx, f)
+                return UploadFileResult()
 
+    def _upload_single_thread_with_known_size(self, ctx: _UploadContext, contents: BinaryIO) -> None:
+        """Upload a file with a known size."""
+        if ctx.content_length < self._config.multipart_upload_min_stream_size:
+            _LOG.debug(f"Using single-shot upload for input stream of size {ctx.content_length} bytes")
+            return self._single_thread_single_shot_upload(ctx, contents)
+        else:
+            _LOG.debug(f"Using multipart upload for input stream of size {ctx.content_length} bytes")
+            return self._single_thread_multipart_upload(ctx, contents)
+
+    def _single_thread_single_shot_upload(self, ctx: _UploadContext, contents: BinaryIO) -> None:
+        """Upload a file with a known size."""
+        _LOG.debug(f"Using single-shot upload for input stream")
+        return super().upload(file_path=ctx.target_path, contents=contents, overwrite=ctx.overwrite)
+
+    def _initiate_multipart_upload(self, ctx: _UploadContext) -> dict:
+        """Initiate a multipart upload and return the response."""
         query = {"action": "initiate-upload"}
-        if overwrite is not None:
-            query["overwrite"] = overwrite
+        if ctx.overwrite is not None:
+            query["overwrite"] = ctx.overwrite
 
         # Method _api.do() takes care of retrying and will raise an exception in case of failure.
         initiate_upload_response = self._api.do(
-            "POST", f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(file_path)}", query=query
+            "POST", f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(ctx.target_path)}", query=query
         )
+        return initiate_upload_response
+
+    def _single_thread_multipart_upload(self, ctx: _UploadContext, contents: BinaryIO) -> None:
+
+        # Upload empty and small files with one-shot upload.
+        pre_read_buffer = contents.read(self._config.multipart_upload_min_stream_size)
+        if len(pre_read_buffer) < self._config.multipart_upload_min_stream_size:
+            _LOG.debug(
+                f"Using one-shot upload for input stream of size {len(pre_read_buffer)} below {self._config.multipart_upload_min_stream_size} bytes"
+            )
+            return self._single_thread_single_shot_upload(ctx, BytesIO(pre_read_buffer))
+
+        # Initiate the multipart upload.
+        initiate_upload_response = self._initiate_multipart_upload(ctx)
 
         if initiate_upload_response.get("multipart_upload"):
             cloud_provider_session = self._create_cloud_provider_session()
@@ -907,37 +1124,26 @@ class FilesExt(files.FilesAPI):
                 raise ValueError(f"Unexpected server response: {initiate_upload_response}")
 
             try:
-                if parallel_mode == "multiprocessing":
-                    # check if content is str
-                    if not isinstance(contents, str):
-                        raise TypeError(f"contents must be a str when use_parallel is True, got {type(contents)}")
-                    self._perform_parallel_multipart_upload_using_multiprocessing(
-                        file_path, contents, session_token, parallelism
-                    )
-                elif parallel_mode == "multithreading":
-                    # check if content is str
-                    if not isinstance(contents, str):
-                        raise TypeError(f"contents must be a str when use_parallel is True, got {type(contents)}")
-                    self._perform_parallel_multipart_upload_using_multithreading(
-                        file_path, contents, session_token, parallelism
-                    )
-                elif parallel_mode == "subprocess":
-                    if not isinstance(contents, str):
-                        raise TypeError(f"contents must be a str when use_parallel is True, got {type(contents)}")
-                    self._perform_parallel_multipart_upload_using_subprocess(
-                        file_path, contents, session_token, parallelism
-                    )
-                else:
-                    self._perform_multipart_upload(
-                        file_path, contents, session_token, pre_read_buffer, cloud_provider_session
-                    )
+                self._perform_multipart_upload(ctx, contents, session_token, pre_read_buffer, cloud_provider_session)
+            except FallbackToUploadUsingFilesApi as e:
+                try:
+                    self._abort_multipart_upload(ctx, session_token, cloud_provider_session)
+                except BaseException as ex:
+                    # ignoring abort as it is a best-effort
+                    _LOG.warning(f"Failed to abort upload: {ex}")
+
+                _LOG.info(f"Falling back to single-shot upload with Files API: {e}")
+                # Concatenate the buffered part and the rest of the stream.
+                full_stream = _ConcatenatedInputStream(BytesIO(e.buffer), contents)
+                return self._single_thread_single_shot_upload(ctx, full_stream)
+
             except Exception as e:
                 _LOG.info(f"Aborting multipart upload on error: {e}")
                 try:
-                    self._abort_multipart_upload(file_path, session_token, cloud_provider_session)
+                    self._abort_multipart_upload(ctx, session_token, cloud_provider_session)
                 except BaseException as ex:
+                    # ignoring abort as it is a best-effort
                     _LOG.warning(f"Failed to abort upload: {ex}")
-                    # ignore, abort is a best-effort
                 finally:
                     # rethrow original exception
                     raise e from None
@@ -945,20 +1151,267 @@ class FilesExt(files.FilesAPI):
         elif initiate_upload_response.get("resumable_upload"):
             cloud_provider_session = self._create_cloud_provider_session()
             session_token = initiate_upload_response["resumable_upload"]["session_token"]
-            self._perform_resumable_upload(
-                file_path, contents, session_token, overwrite, pre_read_buffer, cloud_provider_session
-            )
+
+            try:
+                self._perform_resumable_upload(ctx, contents, session_token, pre_read_buffer, cloud_provider_session)
+            except FallbackToUploadUsingFilesApi as e:
+                _LOG.info(f"Falling back to single-shot upload with Files API: {e}")
+                # concatenate the buffered part and rest of the stream
+                full_stream = _ConcatenatedInputStream(BytesIO(e.buffer), contents)
+                return self._single_thread_single_shot_upload(ctx, full_stream)
         else:
             raise ValueError(f"Unexpected server response: {initiate_upload_response}")
 
+    def _parallel_upload(
+        self,
+        ctx: _UploadContext,
+    ) -> None:
+        """
+        Upload a file using multipart upload with multiple threads.
+        This method is not implemented in this example, but it would typically
+        involve creating multiple threads to upload different parts of the file concurrently.
+        """
+
+        if not ctx.parallelism:
+            ctx.parallelism = (os.cpu_count() - 1) or 1
+
+        initiate_upload_response = self._initiate_multipart_upload(ctx)
+
+        if initiate_upload_response.get("multipart_upload"):
+            cloud_provider_session = self._create_cloud_provider_session()
+            session_token = initiate_upload_response["multipart_upload"].get("session_token")
+            if not session_token:
+                raise ValueError(f"Unexpected server response: {initiate_upload_response}")
+            try:
+                self._parallel_multipart_upload(ctx, session_token)
+            except FallbackToUploadUsingFilesApi as e:
+                try:
+                    self._abort_multipart_upload(ctx, session_token, cloud_provider_session)
+                except Exception as abort_ex:
+                    _LOG.warning(f"Failed to abort upload: {abort_ex}")
+
+                _LOG.info(f"Falling back to single-shot upload with Files API: {e}")
+                # Concatenate the buffered part and the rest of the stream.
+                with open(ctx.source_file_path, "rb") as f:
+                    return self._single_thread_single_shot_upload(ctx, f)
+
+            except Exception as e:
+                _LOG.info(f"Aborting multipart upload on error: {e}")
+                try:
+                    self._abort_multipart_upload(ctx, session_token, cloud_provider_session)
+                except Exception as abort_ex:
+                    _LOG.warning(f"Failed to abort upload: {abort_ex}")
+                finally:
+                    # rethrow original exception
+                    raise e from None
+
+        elif initiate_upload_response.get("resumable_upload"):
+            _LOG.warning("GCP does not support parallel resumable uploads, falling back to single-threaded upload")
+            with open(ctx.source_file_path, "rb") as f:
+                return self._upload_single_thread_with_known_size(ctx, f)
+        else:
+            raise ValueError(f"Unexpected server response: {initiate_upload_response}")
+
+    @dataclass
+    class _MultipartUploadPart:
+        ctx: FilesExt._UploadContext
+        part_index: int
+        part_offset: int
+        part_size: int
+        session_token: str
+
+    def _parallel_multipart_upload(
+        self,
+        ctx: _UploadContext,
+        session_token: str,
+    ) -> None:
+        # Calculate number of parts
+        file_size = os.path.getsize(ctx.source_file_path)
+        part_size = ctx.part_size
+        num_parts = (file_size + part_size - 1) // part_size
+
+        # Create queues and worker threads
+        task_queue = Queue()
+        etags_result_queue = Queue()
+        exception_queue = Queue()
+        aborted = Event()
+        workers = [
+            Thread(target=self._upload_consumer, args=(task_queue, etags_result_queue, exception_queue, aborted))
+            for _ in range(ctx.parallelism)
+        ]
+
+        # Enqueue all parts. Since the task queue is populated before starting the workers, we don't need to signal completion.
+        for part_index in range(1, num_parts + 1):
+            part_offset = (part_index - 1) * part_size
+            part_size = min(part_size, file_size - part_offset)
+            part = self._MultipartUploadPart(ctx, part_index, part_offset, part_size, session_token)
+            task_queue.put(part)
+
+        # Start worker threads
+        for worker in workers:
+            worker.start()
+
+        # Wait for all tasks to be processed
+        task_queue.join()
+        for worker in workers:
+            worker.join()
+
+        # Check for exceptions: if any worker encountered an exception, raise the first one.
+        if not exception_queue.empty():
+            first_exception = exception_queue.get()
+            raise first_exception
+
+        # Collect results from the etags queue
+        etags: dict = {}
+        while not etags_result_queue.empty():
+            part_number, etag = etags_result_queue.get()
+            etags[part_number] = etag
+
+        query = {"action": "complete-upload", "upload_type": "multipart", "session_token": session_token}
+        headers = {"Content-Type": "application/json"}
+        body: dict = {}
+
+        parts = []
+        for part_number, etag in sorted(etags.items()):
+            part = {"part_number": part_number, "etag": etag}
+            parts.append(part)
+
+        body["parts"] = parts
+
+        self._api.do(
+            "POST",
+            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(ctx.target_path)}",
+            query=query,
+            headers=headers,
+            body=body,
+        )
+
+    def _upload_consumer(
+        self,
+        task_queue: Queue[FilesExt._MultipartUploadPart],
+        etags_queue: Queue[tuple[int, str]],
+        exception_queue: Queue[Exception],
+        aborted: Event,
+    ):
+        cloud_provider_session = self._create_cloud_provider_session()
+        while not aborted.is_set():
+            try:
+                part = task_queue.get(block=False)
+            except Empty:
+                break  # The task_queue was populated before the workers were started, so we can exit if it's empty.
+
+            try:
+                etag = self._do_upload_one_part_from_file(
+                    part.ctx,
+                    cloud_provider_session,
+                    part.part_index,
+                    part.part_offset,
+                    part.part_size,
+                    part.session_token,
+                )
+                etags_queue.put((part.part_index, etag))
+            except Exception as e:
+                aborted.set()
+                exception_queue.put(e)
+            finally:
+                task_queue.task_done()
+
+    def _do_upload_one_part_from_file(
+        self,
+        ctx: _UploadContext,
+        cloud_provider_session: requests.Session,
+        part_index: int,
+        part_offset: int,
+        part_size: int,
+        session_token: str,
+    ):
+        retry_count = 0
+        etag = None
+
+        while True:
+            body: dict = {
+                "path": ctx.target_path,
+                "session_token": session_token,
+                "start_part_number": part_index,
+                "count": 1,
+                "expire_time": self._get_upload_url_expire_time(),
+            }
+
+            headers = {"Content-Type": "application/json"}
+
+            # Requesting URLs for the same set of parts is an idempotent operation, safe to retry.
+            try:
+                # Method _api.do() takes care of retrying and will raise an exception in case of failure.
+                upload_part_urls_response = self._api.do(
+                    "POST", "/api/2.0/fs/create-upload-part-urls", headers=headers, body=body
+                )
+            except PermissionDenied as e:
+                if self._is_presigned_urls_disabled_error(e):
+                    raise FallbackToUploadUsingFilesApi(None, f"Presigned URLs are disabled")
+                else:
+                    raise e from None
+
+            upload_part_urls = upload_part_urls_response.get("upload_part_urls", [])
+            if len(upload_part_urls) == 0:
+                raise ValueError(f"Unexpected server response: {upload_part_urls_response}")
+            upload_part_url = upload_part_urls[0]
+            url = upload_part_url["url"]
+            required_headers = upload_part_url.get("headers", [])
+            assert part_index == upload_part_url["part_number"]
+
+            headers: dict = {"Content-Type": "application/octet-stream"}
+            for h in required_headers:
+                headers[h["name"]] = h["value"]
+
+            _LOG.debug(f"Uploading part {part_index}: [{part_offset}, {part_offset + part_size - 1}]")
+
+            with open(ctx.source_file_path, "rb") as chunk:
+                chunk.seek(part_offset)
+                part = BytesIO(chunk.read(part_size))
+
+                def rewind():
+                    part.seek(0, os.SEEK_SET)
+
+                def perform_upload():
+                    return cloud_provider_session.request(
+                        "PUT",
+                        url,
+                        headers=headers,
+                        data=part,
+                        timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
+                    )
+
+                upload_response = self._retry_cloud_idempotent_operation(perform_upload, rewind)
+
+            if upload_response.status_code in (200, 201):
+                etag = upload_response.headers.get("ETag", "")
+                return etag
+            elif FilesExt._is_url_expired_response(upload_response):
+                if retry_count < self._config.multipart_upload_max_retries:
+                    retry_count += 1
+                    _LOG.debug("Upload URL expired, retrying...")
+                    continue
+                else:
+                    raise ValueError(f"Unsuccessful chunk upload: upload URL expired after {retry_count} retries")
+            elif upload_response.status_code == 403:
+                raise FallbackToUploadUsingFilesApi(None, f"Direct upload forbidden: {upload_response.content}")
+            else:
+                message = f"Unsuccessful chunk upload. Response status: {upload_response.status_code}, body: {upload_response.content}"
+                _LOG.warning(message)
+                mapped_error = _error_mapper(upload_response, {})
+                raise mapped_error or ValueError(message)
+        _LOG.debug(
+            f"Completed upload of part {part_index} with ETag: {etag}, chunk offset: {part_offset}, chunk size: {part_size}"
+        )
+
     def _perform_multipart_upload(
         self,
-        target_path: str,
+        ctx: _UploadContext,
         input_stream: BinaryIO,
         session_token: str,
         pre_read_buffer: bytes,
         cloud_provider_session: requests.Session,
-    ):
+    ) -> None:
         """
         Performs multipart upload using presigned URLs on AWS and Azure:
         https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html
@@ -974,7 +1427,7 @@ class FilesExt(files.FilesAPI):
         # AWS signed chunked upload: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
         # https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blobs-tune-upload-download-python#buffering-during-uploads
 
-        chunk_offset = 0  # used only for logging
+        chunk_offset = 0
 
         # This buffer is expected to contain at least multipart_upload_chunk_size bytes.
         # Note that initially buffer can be bigger (from pre_read_buffer).
@@ -984,37 +1437,43 @@ class FilesExt(files.FilesAPI):
         eof = False
         while not eof:
             # If needed, buffer the next chunk.
-            buffer = FilesExt._fill_buffer(buffer, self._config.multipart_upload_chunk_size, input_stream)
+            buffer = FilesExt._fill_buffer(buffer, ctx.part_size, input_stream)
             if len(buffer) == 0:
                 # End of stream, no need to request the next block of upload URLs.
                 break
 
             _LOG.debug(
-                f"Multipart upload: requesting next {self._config.multipart_upload_batch_url_count} upload URLs starting from part {current_part_number}"
+                f"Multipart upload: requesting next {ctx.batch_size} upload URLs starting from part {current_part_number}"
             )
 
             body: dict = {
-                "path": target_path,
+                "path": ctx.target_path,
                 "session_token": session_token,
                 "start_part_number": current_part_number,
-                "count": self._config.multipart_upload_batch_url_count,
-                "expire_time": self._get_url_expire_time(),
+                "count": ctx.batch_size,
+                "expire_time": self._get_upload_url_expire_time(),
             }
 
             headers = {"Content-Type": "application/json"}
 
             # Requesting URLs for the same set of parts is an idempotent operation, safe to retry.
-            # Method _api.do() takes care of retrying and will raise an exception in case of failure.
-            upload_part_urls_response = self._api.do(
-                "POST", "/api/2.0/fs/create-upload-part-urls", headers=headers, body=body
-            )
+            try:
+                # Method _api.do() takes care of retrying and will raise an exception in case of failure.
+                upload_part_urls_response = self._api.do(
+                    "POST", "/api/2.0/fs/create-upload-part-urls", headers=headers, body=body
+                )
+            except PermissionDenied as e:
+                if chunk_offset == 0 and self._is_presigned_urls_disabled_error(e):
+                    raise FallbackToUploadUsingFilesApi(buffer, f"Presigned URLs are disabled")
+                else:
+                    raise e from None
 
             upload_part_urls = upload_part_urls_response.get("upload_part_urls", [])
             if len(upload_part_urls) == 0:
                 raise ValueError(f"Unexpected server response: {upload_part_urls_response}")
 
             for upload_part_url in upload_part_urls:
-                buffer = FilesExt._fill_buffer(buffer, self._config.multipart_upload_chunk_size, input_stream)
+                buffer = FilesExt._fill_buffer(buffer, ctx.part_size, input_stream)
                 actual_buffer_length = len(buffer)
                 if actual_buffer_length == 0:
                     eof = True
@@ -1028,7 +1487,7 @@ class FilesExt(files.FilesAPI):
                 for h in required_headers:
                     headers[h["name"]] = h["value"]
 
-                actual_chunk_length = min(actual_buffer_length, self._config.multipart_upload_chunk_size)
+                actual_chunk_length = min(actual_buffer_length, ctx.part_size)
                 _LOG.debug(
                     f"Uploading part {current_part_number}: [{chunk_offset}, {chunk_offset + actual_chunk_length - 1}]"
                 )
@@ -1044,10 +1503,10 @@ class FilesExt(files.FilesAPI):
                         url,
                         headers=headers,
                         data=chunk,
-                        timeout=self._config.multipart_upload_single_chunk_upload_timeout_seconds,
+                        timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
                     )
 
-                upload_response = self._retry_external_idempotent_operation(perform, rewind)
+                upload_response = self._retry_cloud_idempotent_operation(perform, rewind)
 
                 if upload_response.status_code in (200, 201):
                     # Chunk upload successful
@@ -1072,6 +1531,13 @@ class FilesExt(files.FilesAPI):
                         # don't confuse user with unrelated "Permission denied" error.
                         raise ValueError(f"Unsuccessful chunk upload: upload URL expired")
 
+                elif upload_response.status_code == 403 and chunk_offset == 0:
+                    # We got 403 failure when uploading the very first chunk (we can't tell if it is Azure for sure yet).
+                    # This might happen due to Azure firewall enabled for the customer bucket.
+                    # Let's fallback to using Files API which might be allowlisted to upload, passing
+                    # currently buffered (but not yet uploaded) part of the stream.
+                    raise FallbackToUploadUsingFilesApi(buffer, f"Direct upload forbidden: {upload_response.content}")
+
                 else:
                     message = f"Unsuccessful chunk upload. Response status: {upload_response.status_code}, body: {upload_response.content}"
                     _LOG.warning(message)
@@ -1080,9 +1546,7 @@ class FilesExt(files.FilesAPI):
 
                 current_part_number += 1
 
-        _LOG.debug(
-            f"Completing multipart upload after uploading {len(etags)} parts of up to {self._config.multipart_upload_chunk_size} bytes"
-        )
+        _LOG.debug(f"Completing multipart upload after uploading {len(etags)} parts of up to {ctx.part_size} bytes")
 
         query = {"action": "complete-upload", "upload_type": "multipart", "session_token": session_token}
         headers = {"Content-Type": "application/json"}
@@ -1099,298 +1563,14 @@ class FilesExt(files.FilesAPI):
         # Method _api.do() takes care of retrying and will raise an exception in case of failure.
         self._api.do(
             "POST",
-            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(target_path)}",
-            query=query,
-            headers=headers,
-            body=body,
-        )
-
-    def _perform_parallel_multipart_upload_using_subprocess(
-            self,
-            target_path: str,
-            input_file_path: str,
-            session_token: str,
-            parallelism: Optional[int] = None
-    ):
-        """
-        Performs multipart upload using presigned URLs with subprocess-based parallelism.
-        """
-        current_part_number = 1
-        etags: dict = {}
-
-        if parallelism is None:
-            parallelism = (os.cpu_count() - 1) or 1
-
-        file_size = os.path.getsize(input_file_path)
-        chunk_size = self._config.multipart_upload_chunk_size
-        num_parts = (file_size + chunk_size - 1) // chunk_size
-
-        # Limit subprocesses to parallelism value
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from databricks.sdk.mixins import upload_chunk
-
-        upload_script_path = upload_chunk.__file__
-
-        def run_upload_subprocess(part_index):
-            chunk_offset = (part_index - 1) * chunk_size
-            current_chunk_size = min(chunk_size, file_size - chunk_offset)
-
-            result = subprocess.run(
-                [
-                    sys.executable, upload_script_path,
-                    target_path,
-                    input_file_path,
-                    str(part_index),
-                    str(chunk_offset),
-                    str(current_chunk_size),
-                    session_token
-                ],
-                capture_output=True,
-                text=True
-            )
-
-            if result.returncode != 0:
-                raise RuntimeError(f"Upload subprocess failed: {result.stderr.strip()}")
-
-            try:
-                last_line = next(
-                    line for line in reversed(result.stdout.strip().splitlines()) if line.strip()
-                )
-                parsed = json.loads(last_line)
-            except Exception as e:
-                raise RuntimeError(f"Failed to parse output from subprocess for chunk {part_index}: {e}")
-            return parsed["part_index"], parsed["etag"]
-
-        with ThreadPoolExecutor(max_workers=parallelism) as executor:
-            futures = [executor.submit(run_upload_subprocess, i) for i in range(1, num_parts + 1)]
-            for future in as_completed(futures):
-                part_index, etag = future.result()
-                etags[part_index] = etag
-
-        query = {"action": "complete-upload", "upload_type": "multipart", "session_token": session_token}
-        headers = {"Content-Type": "application/json"}
-        body: dict = {
-            "parts": [{"part_number": part_number, "etag": etag} for part_number, etag in sorted(etags.items())]
-        }
-
-        self._api.do(
-            "POST",
-            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(target_path)}",
-            query=query,
-            headers=headers,
-            body=body,
-        )
-
-    def _perform_parallel_multipart_upload_using_multiprocessing(
-        self,
-        target_path: str,
-        input_file_path: str,
-        session_token: str,
-        parallelism : Optional[int] = None
-    ):
-        """
-        Performs multipart upload using presigned URLs on AWS and Azure with multiprocessing.
-        """
-        # This method is a placeholder for future implementation of parallel multipart upload.
-        current_part_number = 1
-        etags: dict = {}
-
-        if parallelism is None:
-            # default parallelism is set to cpu number
-            parallelism = (os.cpu_count() - 1) or 1
-
-        # calculate file size
-        file_size = os.path.getsize(input_file_path)
-
-        # calculate number of parts to upload
-        chunk_size = self._config.multipart_upload_chunk_size
-        num_parts = (file_size + chunk_size - 1) // chunk_size
-
-        # process pool for parallel uploads
-        with multiprocessing.Pool(parallelism) as pool:
-            futures = []
-            for part_index in range(1, num_parts + 1):
-                chunk_offset = (part_index - 1) * chunk_size
-                chunk_size = min(chunk_size, file_size - chunk_offset)
-                futures.append(
-                    pool.apply_async(
-                        FilesExt._upload_one_chunk,
-                        (target_path, input_file_path, part_index, chunk_offset, chunk_size, session_token)
-                    )
-                )
-
-            for part_index, future in enumerate(futures, 1):
-                etag = future.get()
-                etags[current_part_number] = etag
-                current_part_number += 1
-
-        query = {"action": "complete-upload", "upload_type": "multipart", "session_token": session_token}
-        headers = {"Content-Type": "application/json"}
-        body: dict = {}
-
-        parts = []
-        for part_number, etag in sorted(etags.items()):
-            part = {"part_number": part_number, "etag": etag}
-            parts.append(part)
-
-        body["parts"] = parts
-
-        self._api.do(
-            "POST",
-            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(target_path)}",
-            query=query,
-            headers=headers,
-            body=body,
-        )
-
-    def _perform_parallel_multipart_upload_using_multithreading(
-        self,
-        target_path: str,
-        input_file_path: str,
-        session_token: str,
-        parallelism : Optional[int] = None
-    ):
-        """
-        Performs multipart upload using presigned URLs on AWS and Azure with multithreading.
-        """
-        # This method is a placeholder for future implementation of parallel multipart upload.
-        current_part_number = 1
-        etags: dict = {}
-
-        if parallelism is None:
-            # default parallelism is set to cpu number
-            parallelism = (os.cpu_count() - 1) or 1
-
-        file_size = os.path.getsize(input_file_path)
-
-        chunk_size = self._config.multipart_upload_chunk_size
-        num_parts = (file_size + chunk_size - 1) // chunk_size
-
-        with ThreadPoolExecutor(max_workers=parallelism) as executor:
-            futures = []
-            for part_index in range(1, num_parts + 1):
-                chunk_offset = (part_index - 1) * chunk_size
-                chunk_size = min(chunk_size, file_size - chunk_offset)
-                futures.append(
-                    executor.submit(
-                        self.do_upload_one_chunk,
-                        target_path,
-                        input_file_path,
-                        part_index,
-                        chunk_offset,
-                        chunk_size,
-                        session_token
-                    )
-                )
-
-            for part_index, future in enumerate(futures, 1):
-                etag = future.result()
-                etags[current_part_number] = etag
-                current_part_number += 1
-
-        query = {"action": "complete-upload", "upload_type": "multipart", "session_token": session_token}
-        headers = {"Content-Type": "application/json"}
-        body: dict = {}
-
-        parts = []
-        for part_number, etag in sorted(etags.items()):
-            part = {"part_number": part_number, "etag": etag}
-            parts.append(part)
-
-        body["parts"] = parts
-
-        self._api.do(
-            "POST",
-            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(target_path)}",
+            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(ctx.target_path)}",
             query=query,
             headers=headers,
             body=body,
         )
 
     @staticmethod
-    def _upload_one_chunk(target_path: str, input_file_path: str, part_index: int, chunk_offset: int, chunk_size: int, session_token: str):
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
-        return w.files.do_upload_one_chunk(
-            target_path=target_path,
-            input_file_path=input_file_path,
-            part_index=part_index,
-            chunk_offset=chunk_offset,
-            chunk_size=chunk_size,
-            session_token=session_token
-        )
-
-    def do_upload_one_chunk(self, target_path: str, input_file_path: str, part_index: int, chunk_offset: int, chunk_size: int, session_token: str):
-        retry_count = 0
-        etag = None
-        cloud_provider_session = self._create_cloud_provider_session()
-
-        while True:
-            body: dict = {
-                "path": target_path,
-                "session_token": session_token,
-                "start_part_number": part_index,
-                "count": 1,
-                "expire_time": self._get_url_expire_time(),
-            }
-
-            headers = {"Content-Type": "application/json"}
-
-            upload_part_urls_response = self._api.do(
-                "POST", "/api/2.0/fs/create-upload-part-urls", headers=headers, body=body
-            )
-
-            upload_part_urls = upload_part_urls_response.get("upload_part_urls", [])
-            if len(upload_part_urls) == 0:
-                raise ValueError(f"Unexpected server response: {upload_part_urls_response}")
-            upload_part_url = upload_part_urls[0]
-            url = upload_part_url["url"]
-            required_headers = upload_part_url.get("headers", [])
-            assert part_index == upload_part_url["part_number"]
-
-            headers: dict = {"Content-Type": "application/octet-stream"}
-            for h in required_headers:
-                headers[h["name"]] = h["value"]
-
-            _LOG.debug(
-                f"Uploading part {part_index}: [{chunk_offset}, {chunk_offset + chunk_size - 1}]"
-            )
-
-            with open(input_file_path, 'rb') as chunk:
-                chunk.seek(chunk_offset)
-                data = chunk.read(chunk_size)
-                def perform_upload():
-                    return cloud_provider_session.request(
-                        "PUT",
-                        url,
-                        headers=headers,
-                        data=data,
-                        timeout=self._config.multipart_upload_single_chunk_upload_timeout_seconds,
-                    )
-                upload_response = self._retry_external_idempotent_operation(perform_upload)
-
-            if upload_response.status_code in (200, 201):
-                etag = upload_response.headers.get("ETag", "")
-                return etag
-            elif FilesExt._is_url_expired_response(upload_response):
-                if retry_count < self._config.multipart_upload_max_retries:
-                    retry_count += 1
-                    _LOG.debug("Upload URL expired, retrying...")
-                    continue
-                else:
-                    raise ValueError(f"Unsuccessful chunk upload: upload URL expired after {retry_count} retries")
-            else:
-                message = f"Unsuccessful chunk upload. Response status: {upload_response.status_code}, body: {upload_response.content}"
-                _LOG.warning(message)
-                mapped_error = _error_mapper(upload_response, {})
-                raise mapped_error or ValueError(message)
-        _LOG.debug(
-            f"Completed upload of part {part_index} with ETag: {etag}, chunk offset: {chunk_offset}, chunk size: {chunk_size}"
-        )
-
-
-    @staticmethod
-    def _fill_buffer(buffer: bytes, desired_min_size: int, input_stream: BinaryIO):
+    def _fill_buffer(buffer: bytes, desired_min_size: int, input_stream: BinaryIO) -> bytes:
         """
         Tries to fill given buffer to contain at least `desired_min_size` bytes by reading from input stream.
         """
@@ -1404,7 +1584,7 @@ class FilesExt(files.FilesAPI):
             return buffer
 
     @staticmethod
-    def _is_url_expired_response(response: requests.Response):
+    def _is_url_expired_response(response: requests.Response) -> bool:
         """
         Checks if response matches one of the known "URL expired" responses from the cloud storage providers.
         """
@@ -1437,15 +1617,21 @@ class FilesExt(files.FilesAPI):
 
         return False
 
+    def _is_presigned_urls_disabled_error(self, e: PermissionDenied) -> bool:
+        error_infos = e.get_error_info()
+        for error_info in error_infos:
+            if error_info.reason == "FILES_API_API_IS_NOT_ENABLED":
+                return True
+        return False
+
     def _perform_resumable_upload(
         self,
-        target_path: str,
+        ctx: _UploadContext,
         input_stream: BinaryIO,
         session_token: str,
-        overwrite: bool,
         pre_read_buffer: bytes,
         cloud_provider_session: requests.Session,
-    ):
+    ) -> None:
         """
         Performs resumable upload on GCP: https://cloud.google.com/storage/docs/performing-resumable-uploads
         """
@@ -1473,14 +1659,20 @@ class FilesExt(files.FilesAPI):
         # On the contrary, in multipart upload we can decide to complete upload *after*
         # last chunk has been sent.
 
-        body: dict = {"path": target_path, "session_token": session_token}
+        body: dict = {"path": ctx.target_path, "session_token": session_token}
 
         headers = {"Content-Type": "application/json"}
 
-        # Method _api.do() takes care of retrying and will raise an exception in case of failure.
-        resumable_upload_url_response = self._api.do(
-            "POST", "/api/2.0/fs/create-resumable-upload-url", headers=headers, body=body
-        )
+        try:
+            # Method _api.do() takes care of retrying and will raise an exception in case of failure.
+            resumable_upload_url_response = self._api.do(
+                "POST", "/api/2.0/fs/create-resumable-upload-url", headers=headers, body=body
+            )
+        except PermissionDenied as e:
+            if self._is_presigned_urls_disabled_error(e):
+                raise FallbackToUploadUsingFilesApi(pre_read_buffer, f"Presigned URLs are disabled")
+            else:
+                raise e from None
 
         resumable_upload_url_node = resumable_upload_url_response.get("resumable_upload_url")
         if not resumable_upload_url_node:
@@ -1495,7 +1687,7 @@ class FilesExt(files.FilesAPI):
         try:
             # We will buffer this many bytes: one chunk + read-ahead block.
             # Note buffer may contain more data initially (from pre_read_buffer).
-            min_buffer_size = self._config.multipart_upload_chunk_size + self._multipart_upload_read_ahead_bytes
+            min_buffer_size = ctx.part_size + self._multipart_upload_read_ahead_bytes
 
             buffer = pre_read_buffer
 
@@ -1520,7 +1712,7 @@ class FilesExt(files.FilesAPI):
                     file_size = chunk_offset + actual_chunk_length
                 else:
                     # More chunks expected, let's upload current chunk (excluding read-ahead block).
-                    actual_chunk_length = self._config.multipart_upload_chunk_size
+                    actual_chunk_length = ctx.part_size
                     file_size = "*"
 
                 headers: dict = {"Content-Type": "application/octet-stream"}
@@ -1539,11 +1731,11 @@ class FilesExt(files.FilesAPI):
                             resumable_upload_url,
                             headers={"Content-Range": "bytes */*"},
                             data=b"",
-                            timeout=self._config.multipart_upload_single_chunk_upload_timeout_seconds,
+                            timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
                         )
 
                     try:
-                        return self._retry_external_idempotent_operation(perform)
+                        return self._retry_cloud_idempotent_operation(perform)
                     except RequestException:
                         _LOG.warning("Failed to retrieve upload status")
                         return None
@@ -1554,7 +1746,7 @@ class FilesExt(files.FilesAPI):
                         resumable_upload_url,
                         headers=headers,
                         data=BytesIO(buffer[:actual_chunk_length]),
-                        timeout=self._config.multipart_upload_single_chunk_upload_timeout_seconds,
+                        timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
                     )
 
                     # https://cloud.google.com/storage/docs/performing-resumable-uploads#resume-upload
@@ -1562,7 +1754,6 @@ class FilesExt(files.FilesAPI):
                     # a 503 or 500 response, then you need to resume the interrupted upload from where it left off.
 
                     # Let's follow that for all potentially retryable status codes.
-                    # Together with the catch block below we replicate the logic in _retry_databricks_idempotent_operation().
                     if upload_response.status_code in self._RETRYABLE_STATUS_CODES:
                         if retry_count < self._config.multipart_upload_max_retries:
                             retry_count += 1
@@ -1620,7 +1811,7 @@ class FilesExt(files.FilesAPI):
                     uploaded_bytes_count = next_chunk_offset - chunk_offset
                     chunk_offset = next_chunk_offset
 
-                elif upload_response.status_code == 412 and not overwrite:
+                elif upload_response.status_code == 412 and not ctx.overwrite:
                     # Assuming this is only possible reason
                     # Full message in this case: "At least one of the pre-conditions you specified did not hold."
                     raise AlreadyExists("The file being created already exists.")
@@ -1653,19 +1844,38 @@ class FilesExt(files.FilesAPI):
         else:
             raise ValueError(f"Cannot parse response header: Range: {range_string}")
 
-    def _get_url_expire_time(self):
-        """Generates expiration time and save it in the required format."""
-        current_time = datetime.datetime.now(datetime.timezone.utc)
-        expire_time = current_time + self._config.multipart_upload_url_expiration_duration
+    def _get_rfc339_timestamp_with_future_offset(self, base_time: datetime.datetime, offset: timedelta) -> str:
+        """Generates an offset timestamp in an RFC3339 format suitable for URL generation"""
+        offset_timestamp = base_time + offset
         # From Google Protobuf doc:
         # In JSON format, the Timestamp type is encoded as a string in the
         #   * [RFC 3339](https://www.ietf.org/rfc/rfc3339.txt) format. That is, the
         #   * format is "{year}-{month}-{day}T{hour}:{min}:{sec}[.{frac_sec}]Z"
-        return expire_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return offset_timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def _abort_multipart_upload(self, target_path: str, session_token: str, cloud_provider_session: requests.Session):
+    def _get_upload_url_expire_time(self) -> str:
+        """Generates expiration time in the required format."""
+        current_time = datetime.datetime.now(datetime.timezone.utc)
+        return self._get_rfc339_timestamp_with_future_offset(
+            current_time, self._config.multipart_upload_url_expiration_duration
+        )
+
+    def _get_download_url_expire_time(self) -> str:
+        """Generates expiration time in the required format."""
+        current_time = datetime.datetime.now(datetime.timezone.utc)
+        return self._get_rfc339_timestamp_with_future_offset(
+            current_time, self._config.presigned_download_url_expiration_duration
+        )
+
+    def _abort_multipart_upload(
+        self, ctx: _UploadContext, session_token: str, cloud_provider_session: requests.Session
+    ) -> None:
         """Aborts ongoing multipart upload session to clean up incomplete file."""
-        body: dict = {"path": target_path, "session_token": session_token, "expire_time": self._get_url_expire_time()}
+        body: dict = {
+            "path": ctx.target_path,
+            "session_token": session_token,
+            "expire_time": self._get_upload_url_expire_time(),
+        }
 
         headers = {"Content-Type": "application/json"}
 
@@ -1680,43 +1890,43 @@ class FilesExt(files.FilesAPI):
         for h in required_headers:
             headers[h["name"]] = h["value"]
 
-        def perform():
+        def perform() -> requests.Response:
             return cloud_provider_session.request(
                 "DELETE",
                 abort_url,
                 headers=headers,
                 data=b"",
-                timeout=self._config.multipart_upload_single_chunk_upload_timeout_seconds,
+                timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
             )
 
-        abort_response = self._retry_databricks_idempotent_operation(perform)
+        abort_response = self._retry_cloud_idempotent_operation(perform)
 
         if abort_response.status_code not in (200, 201):
             raise ValueError(abort_response)
 
     def _abort_resumable_upload(
         self, resumable_upload_url: str, required_headers: list, cloud_provider_session: requests.Session
-    ):
+    ) -> None:
         """Aborts ongoing resumable upload session to clean up incomplete file."""
         headers: dict = {}
         for h in required_headers:
             headers[h["name"]] = h["value"]
 
-        def perform():
+        def perform() -> requests.Response:
             return cloud_provider_session.request(
                 "DELETE",
                 resumable_upload_url,
                 headers=headers,
                 data=b"",
-                timeout=self._config.multipart_upload_single_chunk_upload_timeout_seconds,
+                timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
             )
 
-        abort_response = self._retry_databricks_idempotent_operation(perform)
+        abort_response = self._retry_cloud_idempotent_operation(perform)
 
         if abort_response.status_code not in (200, 201):
             raise ValueError(abort_response)
 
-    def _create_cloud_provider_session(self):
+    def _create_cloud_provider_session(self) -> requests.Session:
         """Creates a separate session which does not inherit auth headers from BaseClient session."""
         session = requests.Session()
 
@@ -1729,42 +1939,15 @@ class FilesExt(files.FilesAPI):
         session.mount("http://", http_adapter)
         return session
 
-    def _retry_databricks_idempotent_operation(
-        self, operation: Callable[[], requests.Response], before_retry: Callable = None
+    def _retry_cloud_idempotent_operation(
+        self, operation: Callable[[], requests.Response], before_retry: Optional[Callable] = None
     ) -> requests.Response:
-        """Perform given idempotent operation with necessary retries. Since operation is idempotent it's
-        safe to retry it for response codes where server state might have changed.
+        """Perform given idempotent operation with necessary retries for requests to non Databricks APIs.
+        For cloud APIs, we will retry on network errors and on server response codes.
+        Since operation is idempotent it's safe to retry it for response codes where server state might have changed.
         """
 
-        def delegate():
-            response = operation()
-            if response.status_code in self._RETRYABLE_STATUS_CODES:
-                attrs = {}
-                # this will assign "retry_after_secs" to the attrs, essentially making exception look retryable
-                _RetryAfterCustomizer().customize_error(response, attrs)
-                raise _error_mapper(response, attrs)
-            else:
-                return response
-
-        # following _BaseClient timeout
-        retry_timeout_seconds = self._config.retry_timeout_seconds or 300
-
-        return retried(
-            timeout=timedelta(seconds=retry_timeout_seconds),
-            # also retry on network errors (connection error, connection timeout)
-            # where we believe request didn't reach the server
-            is_retryable=_BaseClient._is_retryable,
-            before_retry=before_retry,
-        )(delegate)()
-
-    def _retry_external_idempotent_operation(
-        self, operation: Callable[[], requests.Response], before_retry: Callable = None
-    ) -> requests.Response:
-        """Perform given idempotent operation with necessary retries. Since operation is idempotent it's
-        safe to retry it for response codes where server state might have changed.
-        """
-
-        def delegate():
+        def delegate() -> requests.Response:
             response = operation()
             if response.status_code in self._RETRYABLE_STATUS_CODES:
                 raise _RetryableException.make_error(response)
@@ -1790,53 +1973,28 @@ class FilesExt(files.FilesAPI):
             # where we believe request didn't reach the server
             is_retryable=extended_is_retryable,
             before_retry=before_retry,
+            clock=self._config.clock,
         )(delegate)()
 
-    def _head_download(
-            self, file_path: str, if_unmodified_since_timestamp: Optional[str] = None
-    ) -> DownloadResponse:
-        """Performs HEAD request to get file metadata, performing necessary retries."""
-        headers = {
-            # "Accept": "application/octet-stream",
-        }
-
-        if if_unmodified_since_timestamp:
-            headers["If-Unmodified-Since"] = if_unmodified_since_timestamp
-
-        response_headers = [
-            "content-length",
-            "content-type",
-            "last-modified",
-        ]
-        # Method _api.do() takes care of retrying and will raise an exception in case of failure.
-        res = self._api.do(
-            "HEAD",
-            f"/api/2.0/fs/files{_escape_multi_segment_path_parameter(file_path)}",
-            headers=headers,
-            response_headers=response_headers,
-        )
-
-        return DownloadResponse.from_dict(res)
-
     def _open_download_stream(
-        self, file_path: str, *, start_byte_offset: Optional[int] = None, end_byte_offset: Optional[int] = None, if_unmodified_since_timestamp: Optional[str] = None
+        self,
+        file_path: str,
+        start_byte_offset: int,
+        end_byte_offset: Optional[int] = None,
+        if_unmodified_since_timestamp: Optional[str] = None,
     ) -> DownloadResponse:
         """Opens a download stream from given offset, performing necessary retries."""
         headers = {
             "Accept": "application/octet-stream",
         }
 
-        if start_byte_offset and if_unmodified_since_timestamp is None:
+        if start_byte_offset and not if_unmodified_since_timestamp:
             raise Exception("if_unmodified_since_timestamp is required if start_byte_offset is specified")
 
-        if end_byte_offset is not None and start_byte_offset is None:
-            raise Exception("start_byte_offset is required if end_byte_offset is specified")
-
-        if start_byte_offset is not None:
-            if end_byte_offset:
-                headers["Range"] = f"bytes={start_byte_offset}-{end_byte_offset}"
-            else:
-                headers["Range"] = f"bytes={start_byte_offset}-"
+        if start_byte_offset > 0 and end_byte_offset is None:
+            headers["Range"] = f"bytes={start_byte_offset}-"
+        elif end_byte_offset is not None:
+            headers["Range"] = f"bytes={start_byte_offset}-{end_byte_offset}"
 
         if if_unmodified_since_timestamp:
             headers["If-Unmodified-Since"] = if_unmodified_since_timestamp
@@ -1846,6 +2004,23 @@ class FilesExt(files.FilesAPI):
             "content-type",
             "last-modified",
         ]
+
+        result = self._init_download_response_mode_csp_with_fallback(file_path, headers, response_headers)
+
+        if not isinstance(result.contents, _StreamingResponse):
+            raise Exception(
+                "Internal error: response contents is of unexpected type: " + type(result.contents).__name__
+            )
+
+        return result
+
+    def _init_download_response_files_api(
+        self, file_path: str, headers: dict[str, str], response_headers: list[str]
+    ) -> DownloadResponse:
+        """
+        Initiates a download response using the Files API.
+        """
+
         # Method _api.do() takes care of retrying and will raise an exception in case of failure.
         res = self._api.do(
             "GET",
@@ -1854,23 +2029,102 @@ class FilesExt(files.FilesAPI):
             response_headers=response_headers,
             raw=True,
         )
+        return DownloadResponse.from_dict(res)
 
-        result = DownloadResponse.from_dict(res)
-        if not isinstance(result.contents, _StreamingResponse):
-            raise Exception(
-                "Internal error: response contents is of unexpected type: " + type(result.contents).__name__
+    def _init_download_response_presigned_api(self, file_path: str, added_headers: dict[str, str]) -> DownloadResponse:
+        """
+        Initiates a download response using the CSP presigned URL API.
+
+        Wrapped in similar retry logic to the internal API.do call:
+        1. Call _.api.do to obtain the presigned URL
+        2. Attempt to establish a streaming connection via the presigned URL
+        3. Construct a StreamingResponse from the presigned URL
+        """
+
+        # Method _api.do() takes care of retrying and will raise an exception in case of failure.
+        raw_response = self._api.do(
+            "POST",
+            f"/api/2.0/fs/create-download-url",
+            query={
+                "path": file_path,
+                "expire_time": self._get_download_url_expire_time(),
+            },
+        )
+
+        url_and_headers = CreateDownloadUrlResponse.from_dict(raw_response)
+
+        cloud_provider_session = self._create_cloud_provider_session()
+
+        header_overlap = added_headers.keys() & url_and_headers.headers.keys()
+        if header_overlap:
+            raise ValueError(
+                f"Provided headers overlap with required headers from the CSP API bundle: {header_overlap}"
             )
 
-        return result
+        merged_headers = {**url_and_headers.headers, **added_headers}
 
-    def _wrap_stream(self, file_path: str, download_response: DownloadResponse):
+        csp_response: _RawResponse = cloud_provider_session.request(
+            "GET",
+            url_and_headers.url,
+            headers=merged_headers,
+            timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
+            stream=True,
+        )
+
+        # Mapping the error if the response is not successful.
+        if csp_response.status_code not in (200, 201):
+            message = (
+                f"Unsuccessful download. Response status: {csp_response.status_code}, body: {csp_response.content}"
+            )
+            _LOG.warning(message)
+            mapped_error = _error_mapper(csp_response, {})
+            raise mapped_error or ValueError(message)
+
+        resp = DownloadResponse(
+            content_length=int(csp_response.headers.get("content-length")),
+            content_type=csp_response.headers.get("content-type"),
+            last_modified=csp_response.headers.get("last-modified"),
+            contents=_StreamingResponse(csp_response),
+        )
+        return resp
+
+    def _init_download_response_mode_csp_with_fallback(
+        self, file_path: str, headers: dict[str, str], response_headers: list[str]
+    ) -> DownloadResponse:
+        """
+        Initiates a download response using the CSP presigned URL API or the Files API, depending on the configuration.
+        If the CSP presigned download API is enabled, it will attempt to use that first.
+        If the CSP API call fails, it will fall back to the Files API.
+        If the CSP presigned download API is disabled, it will use the Files API directly.
+        """
+
+        if self._config.enable_presigned_download_api or self._config.enable_presigned_download_api is None:
+            try:
+                _LOG.debug(f"Attempting download of {file_path} via CSP APIs")
+                return self._init_download_response_presigned_api(file_path, headers)
+            except RequestException:
+                _LOG.debug(f"Attempt via CSP APIs for {file_path} failed. Falling back to download via Files API")
+                ret = self._init_download_response_files_api(file_path, headers, response_headers)
+                return ret
+        else:
+            _LOG.debug(f"Attempting download of {file_path} via Files API because CSP APIs are disabled")
+            return self._init_download_response_files_api(file_path, headers, response_headers)
+
+    def _wrap_stream(
+        self,
+        file_path: str,
+        download_response: DownloadResponse,
+        start_byte_offset: int = 0,
+        end_byte_offset: Optional[int] = None,
+    ) -> "_ResilientResponse":
         underlying_response = _ResilientIterator._extract_raw_response(download_response)
         return _ResilientResponse(
             self,
             file_path,
             download_response.last_modified,
-            offset=0,
+            offset=start_byte_offset,
             underlying_response=underlying_response,
+            end_byte_offset=end_byte_offset,
         )
 
 
@@ -1883,29 +2137,26 @@ class _ResilientResponse(_RawResponse):
         file_last_modified: str,
         offset: int,
         underlying_response: _RawResponse,
-    ):
+        end_byte_offset: Optional[int] = None,
+    ) -> None:
         self.api = api
         self.file_path = file_path
         self.underlying_response = underlying_response
         self.offset = offset
         self.file_last_modified = file_last_modified
+        self.end_byte_offset = end_byte_offset
 
-    def iter_content(self, chunk_size=1, decode_unicode=False):
+    def iter_content(self, chunk_size: int = 1, decode_unicode: bool = False) -> Iterator[bytes]:
         if decode_unicode:
             raise ValueError("Decode unicode is not supported")
 
         iterator = self.underlying_response.iter_content(chunk_size=chunk_size, decode_unicode=False)
         self.iterator = _ResilientIterator(
-            iterator,
-            self.file_path,
-            self.file_last_modified,
-            self.offset,
-            self.api,
-            chunk_size,
+            iterator, self.file_path, self.file_last_modified, self.offset, self.api, chunk_size, self.end_byte_offset
         )
         return self.iterator
 
-    def close(self):
+    def close(self) -> None:
         self.iterator.close()
 
 
@@ -1917,18 +2168,19 @@ class _ResilientIterator(Iterator):
     def _extract_raw_response(
         download_response: DownloadResponse,
     ) -> _RawResponse:
-        streaming_response: _StreamingResponse = download_response.contents  # this is an instance of _StreamingResponse
+        streaming_response: _StreamingResponse = download_response.contents
         return streaming_response._response
 
     def __init__(
         self,
-        underlying_iterator,
+        underlying_iterator: Iterator[bytes],
         file_path: str,
         file_last_modified: str,
         offset: int,
         api: FilesExt,
         chunk_size: int,
-    ):
+        end_byte_offset: Optional[int] = None,
+    ) -> None:
         self._underlying_iterator = underlying_iterator
         self._api = api
         self._file_path = file_path
@@ -1936,6 +2188,7 @@ class _ResilientIterator(Iterator):
         # Absolute current offset (0-based), i.e. number of bytes from the beginning of the file
         # that were so far returned to the caller code.
         self._offset = offset
+        self._end_byte_offset = end_byte_offset
         self._file_last_modified = file_last_modified
         self._chunk_size = chunk_size
 
@@ -1966,10 +2219,12 @@ class _ResilientIterator(Iterator):
         try:
             self._underlying_iterator.close()
 
-            _LOG.debug("Trying to recover from offset " + str(self._offset))
+            _LOG.debug(f"Trying to recover from offset {self._offset} to {self._end_byte_offset}")
 
             # following call includes all the required network retries
-            downloadResponse = self._api._open_download_stream(self._file_path, self._offset, self._file_last_modified)
+            downloadResponse = self._api._open_download_stream(
+                self._file_path, self._offset, self._end_byte_offset, self._file_last_modified
+            )
             underlying_response = _ResilientIterator._extract_raw_response(downloadResponse)
             self._underlying_iterator = underlying_response.iter_content(
                 chunk_size=self._chunk_size, decode_unicode=False
@@ -1979,7 +2234,7 @@ class _ResilientIterator(Iterator):
         except:
             return False  # recover failed, rethrow original exception
 
-    def __next__(self):
+    def __next__(self) -> bytes:
         if self._closed:
             # following _BaseClient
             raise ValueError("I/O operation on closed file")
@@ -1999,6 +2254,6 @@ class _ResilientIterator(Iterator):
                 if not self._recover():
                     raise
 
-    def close(self):
+    def close(self) -> None:
         self._underlying_iterator.close()
         self._closed = True

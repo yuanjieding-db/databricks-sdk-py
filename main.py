@@ -1,10 +1,59 @@
-from typing import Optional
+from tempfile import mkstemp
+from typing import Optional, BinaryIO
 
 from databricks.sdk import WorkspaceClient, FilesAPI
-from io import BytesIO
+from io import BytesIO, RawIOBase, UnsupportedOperation
 import random
+import logging
+import time
 
-TEST_VOLUME = "/Volumes/yuanjie_ding/default/python_sdk_test"
+TEST_CONFIGS = {
+    "GOOGFOOD": "/Volumes/users/yuanjie_ding/default",
+    "AZURE_DOGFOOD": "/Volumes/yuanjie_ding/default/python_sdk_test"
+}
+
+DATABRICKS_PROFILE = "GOOGFOOD"
+TEST_VOLUME = TEST_CONFIGS[DATABRICKS_PROFILE]
+
+class Timer:
+    def __enter__(self):
+        self.start = time.time()
+        return self  # allows use of `as`
+
+    def __exit__(self, *args):
+        self.end = time.time()
+        self.interval = self.end - self.start
+
+class NonSeekableBuffer(RawIOBase, BinaryIO):
+    def __init__(self, data: bytes):
+        self._stream = BytesIO(data)
+
+    def read(self, size=-1):
+        return self._stream.read(size)
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def seek(self, *args, **kwargs):
+        raise UnsupportedOperation("seek not supported")
+
+    def tell(self):
+        raise UnsupportedOperation("tell not supported")
+
+def setup_logging():
+    logging.basicConfig(
+        filename='multipart-uploads-test.log',
+        format='%(asctime)s %(module)s %(levelname)-8s %(message)s',
+        level=logging.DEBUG,
+        datefmt='%Y-%m-%d %H:%M:%S')
+
+    # disable unrelated logging in the notebook
+    for module in ['pyspark', 'py4j', 'clientserver', 'base_comm']:
+        logging.getLogger(module).setLevel(logging.ERROR)
+
 
 def get_ext_files_api(w: WorkspaceClient):
     w.config.multipart_upload_min_stream_size = 0
@@ -30,7 +79,9 @@ def multipart_upload(w: WorkspaceClient):
     files_api = get_ext_files_api(w)
     content_size = 10 * 1024 * 1024  # 10 MB
     content = BytesIO(get_content(content_size, 0))
-    files_api.upload(file_path, content, overwrite=True)
+    with Timer() as t:
+        files_api.upload(file_path, content, overwrite=True)
+    print(f"Multipart upload took {t.interval:.2f} seconds for {content_size / (1024 * 1024):.2f} MB")
     result_content = files_api.download(file_path).contents.read()
 
     assert len(result_content) == content_size, f"Expected {content_size} bytes, got {len(result_content)} bytes"
@@ -72,16 +123,7 @@ def new_download_interface(w: WorkspaceClient):
 
     # Download the file using the new interface 1
     local_file_path = "/tmp/test_download_new_interface.txt"
-    resp = files_api.download(file_path, destination=local_file_path)
-    with open(local_file_path, 'rb') as f:
-        downloaded_content_new = f.read()
-    assert downloaded_content_new == downloaded_content, "Downloaded content does not match uploaded content"
-    print("New download interface test passed successfully.")
-
-    # Download the file using the new interface 2
-    local_file_path = "/tmp/test_download_new_interface.txt"
-    with open(local_file_path, 'wb') as f:
-        resp = files_api.download(file_path, destination=f)
+    files_api.download_to(file_path, destination=local_file_path)
     with open(local_file_path, 'rb') as f:
         downloaded_content_new = f.read()
     assert downloaded_content_new == downloaded_content, "Downloaded content does not match uploaded content"
@@ -115,13 +157,12 @@ def parallel_download(w: WorkspaceClient):
     content = get_content(content_size, 2)
 
     # print(f"Uploading file for parallel download test with size {content_size/1024/1024} MB")
-    # files_api.upload(file_path, BytesIO(content), overwrite=True)
-    # print(f"File uploaded to {file_path}")
+    files_api.upload(file_path, BytesIO(content), overwrite=True)
+    print(f"File uploaded to {file_path}")
 
     # Download the file using the new interface with parallel download
     local_file_path = "/tmp/test_parallel_download.txt"
-    resp = files_api._parallel_download(file_path, destination=local_file_path)
-    print(resp)
+    files_api.download_to(file_path, destination=local_file_path)
     with open(local_file_path, 'rb') as f:
         downloaded_content_parallel = f.read()
 
@@ -149,20 +190,57 @@ def parallel_upload(w: WorkspaceClient, parallel_mode: Optional[str] = None):
     assert downloaded_content == content, "Uploaded content does not match expected content"
     print("Parallel upload test passed successfully.")
 
+def new_upload_interface(w: WorkspaceClient):
+    files_api = get_ext_files_api(w)
+    local_file_path = "/tmp/test_new_interface.txt"
+    file_path = f"{TEST_VOLUME}/test_new_interface.txt"
+    content_string = "This is a test content for the new upload interface."
+
+    # Write the content to a local file
+    with open(local_file_path, 'w') as f:
+        f.write(content_string)
+
+    # Upload the file using the new interface
+    files_api.upload(file_path, local_file_path, overwrite=True)
+    # Verify the upload
+    downloaded_content = files_api.download(file_path).contents.read()
+    assert downloaded_content.decode() == content_string, "Uploaded content does not match expected content"
+    print("New upload interface test passed successfully.")
+
+def download_with_presigned_url(w: WorkspaceClient):
+    files_api = get_ext_files_api(w)
+    file_path = f"{TEST_VOLUME}/test_presigned_download.txt"
+    content_size = 5 * 1024 * 1024
+    content = BytesIO(get_content(content_size, 1))
+    files_api.upload(file_path, content, overwrite=True)
+
+    # Get a presigned URL for downloading the file
+    download_resp = files_api.download(file_path)
+    print(f"content length: {download_resp.content_length} ({download_resp.content_length.__class__})")
+    assert download_resp.content_length == content_size, "Downloaded content does not match expected content"
+    assert download_resp.contents.read() == content, "Downloaded content does not match uploaded content"
+
 ENV_NAME = 'DATABRICKS_ENABLE_EXPERIMENTAL_FILES_API_CLIENT'
 
+
+
 if __name__ == "__main__":
+    setup_logging()
     # Create a WorkspaceClient instance
 
     import os
     os.environ[ENV_NAME] = "true"
 
-    w = WorkspaceClient()
+    print(f"Using profile: {DATABRICKS_PROFILE}")
+    w = WorkspaceClient(profile=DATABRICKS_PROFILE)
     print(f"Using Workspace: {w.config.host}")
+    # dumb_test(w)
 
+    # new_upload_interface(w)
     # multipart_upload(w)
     # new_download_interface(w)
-    # parallel_download(w)
+    parallel_download(w)
     # range_download(w)
-    parallel_upload(w, parallel_mode="subprocess")
+    # parallel_upload(w, parallel_mode="subprocess")
     # single_and_multipart_upload(w)
+    # download_with_presigned_url(w)

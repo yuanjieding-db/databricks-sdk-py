@@ -1,14 +1,18 @@
 import io
 import logging
+import os
 import pathlib
 import platform
 import time
 from typing import Callable, List, Tuple, Union
 
 import pytest
+import requests.exceptions
 
+from databricks.sdk.config import Config
 from databricks.sdk.core import DatabricksError
 from databricks.sdk.service.catalog import VolumeType
+from databricks.sdk.service.files import DownloadResponse
 
 
 def test_local_io(random):
@@ -41,7 +45,6 @@ def test_dbfs_io(w, random):
 
 @pytest.fixture
 def junk(w, random):
-
     def inner(path: str, size=256) -> bytes:
         to_write = random(size).encode()
         with w.dbfs.open(path, write=True) as f:
@@ -54,7 +57,6 @@ def junk(w, random):
 
 @pytest.fixture
 def ls(w):
-
     def inner(root: str, recursive=False) -> List[str]:
         return [f.path.removeprefix(root) for f in w.dbfs.list(root, recursive=recursive)]
 

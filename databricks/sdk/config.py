@@ -60,10 +60,21 @@ def with_user_agent_extra(key: str, value: str):
 class Config:
     host: str = ConfigAttribute(env="DATABRICKS_HOST")
     account_id: str = ConfigAttribute(env="DATABRICKS_ACCOUNT_ID")
+
+    # PAT token.
     token: str = ConfigAttribute(env="DATABRICKS_TOKEN", auth="pat", sensitive=True)
+
+    # Audience for OIDC ID token source accepting an audience as a parameter.
+    # For example, the GitHub action ID token source.
     token_audience: str = ConfigAttribute(env="DATABRICKS_TOKEN_AUDIENCE", auth="github-oidc")
+
+    # Environment variable for OIDC token.
+    oidc_token_env: str = ConfigAttribute(env="DATABRICKS_OIDC_TOKEN_ENV", auth="env-oidc")
+    oidc_token_filepath: str = ConfigAttribute(env="DATABRICKS_OIDC_TOKEN_FILE", auth="file-oidc")
+
     username: str = ConfigAttribute(env="DATABRICKS_USERNAME", auth="basic")
     password: str = ConfigAttribute(env="DATABRICKS_PASSWORD", auth="basic", sensitive=True)
+
     client_id: str = ConfigAttribute(env="DATABRICKS_CLIENT_ID", auth="oauth")
     client_secret: str = ConfigAttribute(env="DATABRICKS_CLIENT_SECRET", auth="oauth", sensitive=True)
     profile: str = ConfigAttribute(env="DATABRICKS_CONFIG_PROFILE")
@@ -99,10 +110,13 @@ class Config:
     disable_async_token_refresh: bool = ConfigAttribute(env="DATABRICKS_DISABLE_ASYNC_TOKEN_REFRESH")
 
     enable_experimental_files_api_client: bool = ConfigAttribute(env="DATABRICKS_ENABLE_EXPERIMENTAL_FILES_API_CLIENT")
+    # Enable the presigned download API, which is part of the experimental files API client.
+    # enable_experimental_files_api_client should be enabled to use this flag
+    enable_presigned_download_api: bool = ConfigAttribute(env="DATABRICKS_ENABLE_PRESIGNED_DOWNLOAD_API")
     files_api_client_download_max_total_recovers = None
     files_api_client_download_max_total_recovers_without_progressing = 1
 
-    # File multipart upload parameters
+    # File multipart upload/download parameters
     # ----------------------
 
     # Minimal input stream size (bytes) to use multipart / resumable uploads.
@@ -121,21 +135,42 @@ class Config:
     # and using them immediately.
     multipart_upload_batch_url_count: int = 1
 
-    # Size of the chunk to use for multipart uploads.
+    # Size of the chunk to use for multipart uploads & downloads.
     #
     # The smaller chunk is, the less chance for network errors (or URL get expired),
     # but the more requests we'll make.
     # For AWS, minimum is 5Mb: https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
     # For GCP, minimum is 256 KiB (and also recommended multiple is 256 KiB)
     # boto uses 8Mb: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/customizations/s3.html#boto3.s3.transfer.TransferConfig
-    multipart_upload_chunk_size: int = 10 * 1024 * 1024
+    multipart_upload_default_part_size: int = 10 * 1024 * 1024 # 10 MiB
+
+    # List of multipart upload part sizes that can be automatically selected
+    multipart_upload_part_size_options: list[int] = [
+        10 * 1024 * 1024, # 10 MiB
+        20 * 1024 * 1024, # 20 MiB
+        50 * 1024 * 1024, # 50 MiB
+        100 * 1024 * 1024, #100 MiB
+        200 * 1024 * 1024, # 200 MiB
+        500 * 1024 * 1024, # 500 MiB
+        1 * 1024 * 1024 * 1024, # 1 GiB
+        2 * 1024 * 1024 * 1024, # 2 GiB
+        5 * 1024 * 1024 * 1024, # 5 GiB
+    ]
+
+    # Maximum size of a single part in multipart upload.
+    # For AWS, maximum is 5 GiB: https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+    multipart_upload_max_part_size: int = 5 * 1024 * 1024 * 1024  # 5 GiB
+
+    # Default parallel multipart upload concurrency.
+    multipart_upload_parallelism: int = 10
 
     # use maximum duration of 1 hour
     multipart_upload_url_expiration_duration: datetime.timedelta = datetime.timedelta(hours=1)
+    presigned_download_url_expiration_duration: datetime.timedelta = datetime.timedelta(hours=1)
 
     # This is not a "wall time" cutoff for the whole upload request,
     # but a maximum time between consecutive data reception events (even 1 byte) from the server
-    multipart_upload_single_chunk_upload_timeout_seconds: float = 60
+    files_ext_network_transfer_inactivity_timeout_seconds: float = 60
 
     # Cap on the number of custom retries during incremental uploads:
     # 1) multipart: upload part URL is expired, so new upload URLs must be requested to continue upload
@@ -194,7 +229,7 @@ class Config:
     def wrap_debug_info(self, message: str) -> str:
         debug_string = self.debug_string()
         if debug_string:
-            message = f'{message.rstrip(".")}. {debug_string}'
+            message = f"{message.rstrip('.')}. {debug_string}"
         return message
 
     @staticmethod
@@ -337,9 +372,9 @@ class Config:
             safe = "***" if attr.sensitive else f"{value}"
             attrs_used.append(f"{attr.name}={safe}")
         if attrs_used:
-            buf.append(f'Config: {", ".join(attrs_used)}')
+            buf.append(f"Config: {', '.join(attrs_used)}")
         if envs_used:
-            buf.append(f'Env: {", ".join(envs_used)}')
+            buf.append(f"Env: {', '.join(envs_used)}")
         return ". ".join(buf)
 
     def to_dict(self) -> Dict[str, any]:
@@ -481,7 +516,7 @@ class Config:
         if profile not in profiles:
             raise ValueError(f"resolve: {config_path} has no {profile} profile configured")
         raw_config = profiles[profile]
-        logger.info(f'loading {profile} profile from {config_file}: {", ".join(raw_config.keys())}')
+        logger.info(f"loading {profile} profile from {config_file}: {', '.join(raw_config.keys())}")
         for k, v in raw_config.items():
             if k in self._inner:
                 # don't overwrite a value previously set

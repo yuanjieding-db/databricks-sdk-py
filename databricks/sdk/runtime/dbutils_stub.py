@@ -128,18 +128,6 @@ class dbutils:
             ...
 
         @staticmethod
-        def cacheFiles(*files): ...
-
-        @staticmethod
-        def cacheTable(name: str): ...
-
-        @staticmethod
-        def uncacheFiles(*files): ...
-
-        @staticmethod
-        def uncacheTable(name: str): ...
-
-        @staticmethod
         def mount(
             source: str,
             mount_point: str,
