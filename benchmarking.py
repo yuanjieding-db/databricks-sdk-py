@@ -28,10 +28,11 @@ import os
 import shutil
 import traceback
 from databricks.sdk import WorkspaceClient
-from tests.test_files_utils import NonSeekableBuffer
-from typing import Optional, Tuple
+from typing import Optional, Tuple, BinaryIO
+from io import RawIOBase, BytesIO, UnsupportedOperation
 from requests import Session, Request, PreparedRequest
 from typing import Callable
+import json
 
 import logging
 import time
@@ -44,6 +45,45 @@ TEST_CONFIGS = {
 
 DATABRICKS_PROFILE = "GOOGFOOD"
 TEST_VOLUME = TEST_CONFIGS[DATABRICKS_PROFILE]
+
+# Global variable to control checkpoint mechanism
+ENABLE_CHECKPOINT = True
+CHECKPOINT_FILE = "benchmark_checkpoint.json"
+
+class NonSeekableBuffer(RawIOBase, BinaryIO):
+    """
+    A non-seekable buffer that wraps a bytes object. Used for unit tests only.
+    This class implements the BinaryIO interface but does not support seeking.
+    It is used to simulate a non-seekable stream for testing purposes.
+    """
+
+    def __init__(self, data: Tuple[bytes, BytesIO]):
+        if isinstance(data, bytes):
+            self._stream = BytesIO(data)
+        else:
+            self._stream = data
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def readline(self, size: int = -1) -> bytes:
+        return self._stream.readline(size)
+
+    def readlines(self, size: int = -1) -> list[bytes]:
+        return self._stream.readlines(size)
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def seek(self, *args, **kwargs) -> int:
+        raise UnsupportedOperation("seek not supported")
+
+    def tell(self) -> int:
+        raise UnsupportedOperation("tell not supported")
+
 
 def setup_logging():
     logging.basicConfig(
@@ -106,6 +146,23 @@ def instrument_session(session: Session, hook: Callable[[str, str, int], None]):
     session.hooks['response'] = [response_hook]
     return session
 
+def save_checkpoint(state):
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(state, f)
+
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r") as f:
+            return json.load(f)
+    return None
+
+def checkpoint_matches(config, checkpoint):
+    # Compare config lists for equality
+    for key in ["file_sizes", "source_types", "parallel_modes", "client_types"]:
+        if config[key] != checkpoint.get(key):
+            return False
+    return True
+
 def single_run(
         w: WorkspaceClient,
         csv_writer,
@@ -156,6 +213,9 @@ def single_run(
 
     try:
         # upload file
+        if not is_files_ext and file_size > 5 * 1024 * 1024 * 1024:
+            log(f"Skipping upload with FilesAPI as file size {file_size} bytes is > 5GB which is not supported")
+            return # skip upload with FilesAPI if file size is > 5GB as it is not supported
         if is_files_ext and source_type == "file_path":
             w.files.upload_from(
                 target_remote_path,
@@ -170,8 +230,10 @@ def single_run(
                 with open(source_local_path, "rb") as input_stream:
                     w.files.upload(target_remote_path, NonSeekableBuffer(input_stream), overwrite=True)
             else:
+                log("Skipping nonseekable stream upload in parallel mode")
                 return  # nonseekable stream upload is only supported in sequential mode
         else:
+            log("Skipping upload as source type is file_path but client is not FilesExt")
             # only FilesExt supports upload from file
             return
 
@@ -200,10 +262,6 @@ def single_run(
 
         upload_duration_s = upload_complete_time - upload_start_time
         download_duration_s = download_complete_time - upload_complete_time
-        try:
-            part_size_val = part_size if part_size else w.files._config.multipart_upload_default_part_size
-        except Exception:
-            part_size_val = "0"
         values = [
             files_api_class(w),
             source_type,
@@ -328,17 +386,43 @@ def main():
     source_types = ["nonseekable_stream", "file_path"]
     file_sizes = [
         1 * 1024 * 1024, # 1 MB
-        10 * 1024 * 1024, # 10 MB
+        # 10 * 1024 * 1024, # 10 MB
+        # 20 * 1024 * 1024, # 20 MB
+        # 50 * 1024 * 1024, # 50 MB
         # 100 * 1024 * 1024, # 100 MB
+        # 200 * 1024 * 1024, # 200 MB
         # 500 * 1024 * 1024, # 500 MB
         # 1 * 1024 * 1024 * 1024, # 1 GB
         # 2 * 1024 * 1024 * 1024, # 2 GB
-        # 4 * 1024 * 1024 * 1024, # 4 GB
+        # 5 * 1024 * 1024 * 1024, # 5 GB
         # 10 * 1024 * 1024 * 1024, # 10 GB
         # 20 * 1024 * 1024 * 1024, # 20 GB
-        # 50 * 1024 * 1024 * 1024, # 50 GB
-        # 100 * 1024 * 1024 * 1024 # 100 GB
     ]
+    config = {
+        "file_sizes": file_sizes,
+        "source_types": source_types,
+        "parallel_modes": parallel_modes,
+        "client_types": client_types
+    }
+    checkpoint = None
+    start_indices = {
+        "client_type": 0,
+        "source_type": 0,
+        "file_size": 0,
+        "parallel_mode": 0,
+        "run_id": 0
+    }
+    csv_mode = "w"
+    csv_filename = output_file
+    if ENABLE_CHECKPOINT:
+        checkpoint = load_checkpoint()
+        if checkpoint and checkpoint_matches(config, checkpoint):
+            start_indices = checkpoint["indices"]
+            csv_filename = checkpoint.get("csv_filename", output_file)
+            csv_mode = "a"
+            print(f"Resuming from checkpoint: {start_indices}, CSV: {csv_filename}")
+        else:
+            print("No matching checkpoint found or configuration changed. Starting fresh.")
     print(f"Will be uploading to {DATABRICKS_PROFILE}, Volume: {TEST_VOLUME}")
     print(f"Will be using client types: {client_types}")
     print(f"Will be using source types: {source_types}")
@@ -362,25 +446,70 @@ def main():
     total_size = sum(file_sizes) * runs_per_file_size
     counter_pbar = tqdm(total=len(file_sizes) * runs_per_file_size, desc="Runs progress")
     with tqdm(total=total_size, unit="B", unit_scale=True, desc="Upload Data progress", position=1, leave=False) as pbar:
-        with open(output_file, 'w') as f:
+        with open(csv_filename, csv_mode) as f:
             csv_writer = csv.writer(f)
-            csv_writer.writerow(columns)
-            for client_type in client_types:
+            if csv_mode == "w":
+                csv_writer.writerow(columns)
+            for i_client_type, client_type in enumerate(client_types):
+                if i_client_type < start_indices["client_type"]:
+                    continue
                 w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=running_in_notebook)
-                for source_type in source_types:
-                    for file_size in file_sizes:
-                        for parallel_mode in parallel_modes:
-                            run_series(
-                                w=w,
-                                counter_pbar=counter_pbar,
-                                pbar=pbar,
-                                csv_writer=csv_writer,
-                                source_type=source_type,
-                                runs_count=runs_count,
-                                parallel_mode=parallel_mode,
-                                file_size=file_size,
-                                volume_path=TEST_VOLUME)
-                            f.flush()
+                for i_source_type, source_type in enumerate(source_types):
+                    if i_client_type == start_indices["client_type"] and i_source_type < start_indices["source_type"]:
+                        continue
+                    for i_file_size, file_size in enumerate(file_sizes):
+                        if (i_client_type == start_indices["client_type"] and
+                            i_source_type == start_indices["source_type"] and
+                            i_file_size < start_indices["file_size"]):
+                            continue
+                        for i_parallel_mode, parallel_mode in enumerate(parallel_modes):
+                            if (i_client_type == start_indices["client_type"] and
+                                i_source_type == start_indices["source_type"] and
+                                i_file_size == start_indices["file_size"] and
+                                i_parallel_mode < start_indices["parallel_mode"]):
+                                continue
+                            for run_id in range(runs_count):
+                                if (i_client_type == start_indices["client_type"] and
+                                    i_source_type == start_indices["source_type"] and
+                                    i_file_size == start_indices["file_size"] and
+                                    i_parallel_mode == start_indices["parallel_mode"] and
+                                    run_id < start_indices["run_id"]):
+                                    continue
+                                run_series(
+                                    w=w,
+                                    counter_pbar=counter_pbar,
+                                    pbar=pbar,
+                                    csv_writer=csv_writer,
+                                    source_type=source_type,
+                                    runs_count=1,
+                                    parallel_mode=parallel_mode,
+                                    file_size=file_size,
+                                    volume_path=TEST_VOLUME)
+                                # Save checkpoint after each run
+                                if ENABLE_CHECKPOINT:
+                                    checkpoint_state = {
+                                        "file_sizes": file_sizes,
+                                        "source_types": source_types,
+                                        "parallel_modes": parallel_modes,
+                                        "client_types": client_types,
+                                        "indices": {
+                                            "client_type": i_client_type,
+                                            "source_type": i_source_type,
+                                            "file_size": i_file_size,
+                                            "parallel_mode": i_parallel_mode,
+                                            "run_id": run_id + 1
+                                        },
+                                        "csv_filename": csv_filename
+                                    }
+                                    save_checkpoint(checkpoint_state)
+                            # Reset run_id for next combination
+                            start_indices["run_id"] = 0
+                        start_indices["parallel_mode"] = 0
+                    start_indices["file_size"] = 0
+                start_indices["source_type"] = 0
+            # Remove checkpoint file when done
+            if ENABLE_CHECKPOINT and os.path.exists(CHECKPOINT_FILE):
+                os.remove(CHECKPOINT_FILE)
 
 if __name__ == "__main__":
     main()
