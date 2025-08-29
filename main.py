@@ -4,8 +4,10 @@ from typing import Optional, BinaryIO
 from databricks.sdk import WorkspaceClient, FilesAPI
 from databricks.sdk.mixins.files import CreateDownloadUrlResponse
 from io import BytesIO, RawIOBase, UnsupportedOperation
+from databricks.sdk._base_client import _StreamingResponse
 import random
 import requests
+import shutil
 import logging
 import time
 
@@ -203,8 +205,9 @@ def parallel_upload(w: WorkspaceClient, parallel_mode: Optional[str] = None):
 def download_performance_test(w: WorkspaceClient):
     files_api = get_ext_files_api(w)
     file_path = f"{TEST_VOLUME}/test_download_performance.txt"
-    content_size = 5 * 1024 * 1024
+    content_size = 10 * 1024 * 1024
     content = get_content(content_size, 4)
+    local_file_path = "/tmp/download-file.txt"
 
     print(f"Uploading file for download performance test with size {content_size/1024/1024} MB")
     files_api.upload(file_path, BytesIO(content), overwrite=True)
@@ -219,14 +222,46 @@ def download_performance_test(w: WorkspaceClient):
     assert downloaded_content == content, "Downloaded content does not match uploaded content"
     print(f"[E2E old client]Downloaded file in {t.interval:.2f} seconds")
 
-    # Download E2E the file using the new interface
+    # Download E2E the file using the old interface, copy to a local file
+    with Timer() as t:
+        resp = files_api.download(file_path, force_old_client=True)
+        if resp.contents is None:
+            raise ValueError("Response contents is None")
+        with open(local_file_path, 'wb') as f:
+            shutil.copyfileobj(resp.contents, f)
+    with open(local_file_path, 'rb') as f:
+        downloaded_content = f.read()
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
+    print(f"[E2E old client, copy to local file]Downloaded file in {t.interval:.2f} seconds")
+
+    # Download E2E the file using the new interface, download to local file
+    with Timer() as t:
+        files_api.download_to(file_path, destination=local_file_path)
+    with open(local_file_path, 'rb') as f:
+        downloaded_content = f.read()
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
+    print(f"[E2E new client to local file]Downloaded file in {t.interval:.2f} seconds")
+
+    # E2E Download the file using the new interface
     with Timer() as t:
         resp = files_api.download(file_path)
         if resp.contents is None:
             raise ValueError("Response contents is None")
         downloaded_content = resp.contents.read()
     assert downloaded_content == content, "Downloaded content does not match uploaded content"
-    print(f"[E2E new client]Downloaded file in {t.interval:.2f} seconds")
+    print(f"[E2E new client]Downloaded file to memory in {t.interval:.2f} seconds")
+
+    # E2E Download the file using the new interface, copy to local file using shutils
+    with Timer() as t:
+        resp = files_api.download(file_path)
+        if resp.contents is None:
+            raise ValueError("Response contents is None")
+        with open(local_file_path, "wb") as f:
+            shutil.copyfileobj(resp.contents, f)
+    print(f"[E2E new client]Downloaded file, copy to local file {t.interval:.2f} seconds")
+    with open(local_file_path, 'rb') as f:
+        downloaded_content = f.read()
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
 
     # Get the presigned URL and download the file using requests
     with Timer() as t:
@@ -248,6 +283,59 @@ def download_performance_test(w: WorkspaceClient):
         response.raise_for_status()
         downloaded_content = response.content
     print(f"[Presigned URL]Downloaded file in {t.interval:.2f} seconds")
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
+
+    # Get the presigned URL and download the file using requests
+    with Timer() as t:
+        raw_response = files_api._api.do(
+            "POST",
+            f"/api/2.0/fs/create-download-url",
+            query={
+                "path": file_path,
+                "expire_time": files_api._get_download_url_expire_time(),
+            },
+        )
+        url_and_headers = CreateDownloadUrlResponse.from_dict(raw_response)
+    print(f"Got presigned URL in {t.interval:.2f} seconds")
+    if url_and_headers.url is None:
+        raise ValueError("Presigned URL is None")
+    print(f"Presigned URL: {url_and_headers.url}")
+    with Timer() as t:
+        response = requests.get(url_and_headers.url, headers=url_and_headers.headers, stream=True)
+        response.raise_for_status()
+        with open(local_file_path, "wb") as f:
+            shutil.copyfileobj(response.raw, f)
+    print(f"[Presigned URL + copyfileobj]Downloaded file in {t.interval:.2f} seconds")
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
+
+    # Get the presigned URL and download the file using requests
+    with Timer() as t:
+        raw_response = files_api._api.do(
+            "POST",
+            f"/api/2.0/fs/create-download-url",
+            query={
+                "path": file_path,
+                "expire_time": files_api._get_download_url_expire_time(),
+            },
+        )
+        url_and_headers = CreateDownloadUrlResponse.from_dict(raw_response)
+    print(f"Got presigned URL in {t.interval:.2f} seconds")
+    if url_and_headers.url is None:
+        raise ValueError("Presigned URL is None")
+    print(f"Presigned URL: {url_and_headers.url}")
+    with Timer() as t:
+        cloud_provider_session = files_api._create_cloud_provider_session()
+        csp_response = cloud_provider_session.request(
+            "GET",
+            url_and_headers.url,
+            headers=url_and_headers.headers,
+            timeout=files_api._config.files_ext_network_transfer_inactivity_timeout_seconds,
+            stream=True,
+        )
+        stream_response = _StreamingResponse(csp_response)
+        with open(local_file_path, "wb") as f:
+            shutil.copyfileobj(stream_response, f)
+    print(f"[Presigned URL + copyfileobj]Downloaded file in {t.interval:.2f} seconds")
     assert downloaded_content == content, "Downloaded content does not match uploaded content"
 
     print("Download performance test passed successfully.")

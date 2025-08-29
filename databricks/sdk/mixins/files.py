@@ -2087,7 +2087,7 @@ class FilesExt(files.FilesAPI):
             content_length=int(csp_response.headers.get("content-length")),
             content_type=csp_response.headers.get("content-type"),
             last_modified=csp_response.headers.get("last-modified"),
-            contents=_StreamingResponse(csp_response),
+            contents=_StreamingResponse(csp_response, chunk_size=2*1024*1024),
         )
         return resp
 
