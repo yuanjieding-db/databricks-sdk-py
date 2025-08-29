@@ -957,6 +957,7 @@ class FilesExt(files.FilesAPI):
                         _LOG.debug(
                             f"Optimized part size for upload: {chosen_part_size} bytes for content length {ctx.content_length} bytes"
                         )
+                        break
                 if chosen_part_size is None:  # If no part size was chosen, we default to the maximum allowed part size.
                     chosen_part_size = self._config.multipart_upload_max_part_size
 
@@ -1234,6 +1235,8 @@ class FilesExt(files.FilesAPI):
         part_size = ctx.part_size
         num_parts = (file_size + part_size - 1) // part_size
 
+        _LOG.debug(f"[Parallel Multipart Upload] Uploading file of size {file_size} bytes in {num_parts} parts of size {part_size} bytes")
+
         # Create queues and worker threads
         task_queue = Queue()
         etags_result_queue = Queue()
@@ -1243,6 +1246,8 @@ class FilesExt(files.FilesAPI):
             Thread(target=self._upload_consumer, args=(task_queue, etags_result_queue, exception_queue, aborted))
             for _ in range(ctx.parallelism)
         ]
+
+        _LOG.debug(f"Starting {len(workers)} worker threads for parallel upload")
 
         # Enqueue all parts. Since the task queue is populated before starting the workers, we don't need to signal completion.
         for part_index in range(1, num_parts + 1):
