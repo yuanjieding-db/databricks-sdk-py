@@ -241,12 +241,22 @@ def single_run(
         log(f"Upload of file of {file_size} bytes succeeded in {int(upload_complete_time - upload_start_time)} s")
 
         # download file
-        download_response = w.files.download(target_remote_path)
-        contents = getattr(download_response, "contents", None)
-        if contents is None:
-            raise Exception("Download response does not contain file contents.")
-        with open(local_path_copy, "wb") as file:
-            shutil.copyfileobj(contents, file)
+        if is_files_ext and source_type == "file_path":
+            w.files.download_to(
+                target_remote_path,
+                local_path_copy,
+                overwrite=True,
+                use_parallel=(parallel_mode == "parallel"),
+                parallelism=parallelism if parallel_mode == "parallel" else None
+            )
+        else:
+            download_response = w.files.download(target_remote_path)
+            contents = getattr(download_response, "contents", None)
+            if contents is None:
+                raise Exception("Download response does not contain file contents.")
+            with open(local_path_copy, "wb") as file:
+                shutil.copyfileobj(contents, file)
+        
 
         download_complete_time = time.time()
 
@@ -382,30 +392,30 @@ def main():
         runs_count = int(args.runs_count) if args.runs_count else DEFAULT_RUNS_COUNT
 
     client_types = [
-        "FilesAPI",
+        # "FilesAPI",
         "FilesExt",
     ]
     parallel_modes = [
         "parallel",
-        "sequential",
+        # "sequential",
     ]
     source_types = [
-        "nonseekable_stream",
+        # "nonseekable_stream",
         "file_path",
     ]
     file_sizes = [
-        1 * 1024 * 1024, # 1 MB
-        10 * 1024 * 1024, # 10 MB
-        20 * 1024 * 1024, # 20 MB
-        50 * 1024 * 1024, # 50 MB
+        # 1 * 1024 * 1024, # 1 MB
+        # 10 * 1024 * 1024, # 10 MB
+        # 20 * 1024 * 1024, # 20 MB
+        # 50 * 1024 * 1024, # 50 MB
         100 * 1024 * 1024, # 100 MB
-        200 * 1024 * 1024, # 200 MB
-        500 * 1024 * 1024, # 500 MB
-        1 * 1024 * 1024 * 1024, # 1 GB
-        2 * 1024 * 1024 * 1024, # 2 GB
-        5 * 1024 * 1024 * 1024, # 5 GB
-        10 * 1024 * 1024 * 1024, # 10 GB
-        20 * 1024 * 1024 * 1024, # 20 GB
+        # 200 * 1024 * 1024, # 200 MB
+        # 500 * 1024 * 1024, # 500 MB
+        # 1 * 1024 * 1024 * 1024, # 1 GB
+        # 2 * 1024 * 1024 * 1024, # 2 GB
+        # 5 * 1024 * 1024 * 1024, # 5 GB
+        # 10 * 1024 * 1024 * 1024, # 10 GB
+        # 20 * 1024 * 1024 * 1024, # 20 GB
     ]
     config = {
         "file_sizes": file_sizes,
