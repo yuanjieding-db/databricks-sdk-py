@@ -793,7 +793,6 @@ class FilesExt(files.FilesAPI):
     def download(
         self,
         file_path: str,
-        force_old_client: bool = False,
     ) -> DownloadResponse:
         """Download a file.
 
@@ -809,9 +808,7 @@ class FilesExt(files.FilesAPI):
 
         :returns: :class:`DownloadResponse`
         """
-        if force_old_client:
-            return super().download(file_path)
-        
+
         initial_response: DownloadResponse = self._open_download_stream(
             file_path=file_path, start_byte_offset=0, if_unmodified_since_timestamp=None
         )
@@ -937,7 +934,6 @@ class FilesExt(files.FilesAPI):
         self, ctx: _UploadContext, part_size_overwrite: Optional[int]
     ) -> (Optional[int], Optional[int]):
         chosen_part_size = None
-        chosen_batch_size = None
 
         # 1. decide on the part size
         if part_size_overwrite is not None:  # If a part size is provided, we use it directly after validation.
@@ -1179,9 +1175,8 @@ class FilesExt(files.FilesAPI):
         if not ctx.parallelism:
             ctx.parallelism = (os.cpu_count() - 1) or 1
 
-        _LOG.debug(f"Using parallel multipart upload with {ctx.parallelism} threads")
         initiate_upload_response = self._initiate_multipart_upload(ctx)
-        
+
         if initiate_upload_response.get("multipart_upload"):
             cloud_provider_session = self._create_cloud_provider_session()
             session_token = initiate_upload_response["multipart_upload"].get("session_token")
@@ -1234,8 +1229,7 @@ class FilesExt(files.FilesAPI):
         file_size = os.path.getsize(ctx.source_file_path)
         part_size = ctx.part_size
         num_parts = (file_size + part_size - 1) // part_size
-
-        _LOG.debug(f"[Parallel Multipart Upload] Uploading file of size {file_size} bytes in {num_parts} parts of size {part_size} bytes")
+        _LOG.debug(f"Uploading file of size {file_size} bytes in {num_parts} parts using {ctx.parallelism} threads")
 
         # Create queues and worker threads
         task_queue = Queue()
@@ -1246,7 +1240,6 @@ class FilesExt(files.FilesAPI):
             Thread(target=self._upload_consumer, args=(task_queue, etags_result_queue, exception_queue, aborted))
             for _ in range(ctx.parallelism)
         ]
-
         _LOG.debug(f"Starting {len(workers)} worker threads for parallel upload")
 
         # Enqueue all parts. Since the task queue is populated before starting the workers, we don't need to signal completion.
@@ -2093,7 +2086,7 @@ class FilesExt(files.FilesAPI):
             content_length=int(csp_response.headers.get("content-length")),
             content_type=csp_response.headers.get("content-type"),
             last_modified=csp_response.headers.get("last-modified"),
-            contents=_StreamingResponse(csp_response, chunk_size=2*1024*1024),
+            contents=_StreamingResponse(csp_response, self._config.files_api_client_download_streaming_chunk_size)
         )
         return resp
 

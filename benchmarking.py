@@ -381,22 +381,31 @@ def main():
         args = parser.parse_args()
         runs_count = int(args.runs_count) if args.runs_count else DEFAULT_RUNS_COUNT
 
-    client_types = ["FilesAPI", "FilesExt"]
-    parallel_modes = ["parallel", "sequential"]
-    source_types = ["nonseekable_stream", "file_path"]
+    client_types = [
+        "FilesAPI",
+        "FilesExt",
+    ]
+    parallel_modes = [
+        "parallel",
+        "sequential",
+    ]
+    source_types = [
+        "nonseekable_stream",
+        "file_path",
+    ]
     file_sizes = [
         1 * 1024 * 1024, # 1 MB
-        # 10 * 1024 * 1024, # 10 MB
-        # 20 * 1024 * 1024, # 20 MB
-        # 50 * 1024 * 1024, # 50 MB
-        # 100 * 1024 * 1024, # 100 MB
-        # 200 * 1024 * 1024, # 200 MB
-        # 500 * 1024 * 1024, # 500 MB
-        # 1 * 1024 * 1024 * 1024, # 1 GB
-        # 2 * 1024 * 1024 * 1024, # 2 GB
-        # 5 * 1024 * 1024 * 1024, # 5 GB
-        # 10 * 1024 * 1024 * 1024, # 10 GB
-        # 20 * 1024 * 1024 * 1024, # 20 GB
+        10 * 1024 * 1024, # 10 MB
+        20 * 1024 * 1024, # 20 MB
+        50 * 1024 * 1024, # 50 MB
+        100 * 1024 * 1024, # 100 MB
+        200 * 1024 * 1024, # 200 MB
+        500 * 1024 * 1024, # 500 MB
+        1 * 1024 * 1024 * 1024, # 1 GB
+        2 * 1024 * 1024 * 1024, # 2 GB
+        5 * 1024 * 1024 * 1024, # 5 GB
+        10 * 1024 * 1024 * 1024, # 10 GB
+        20 * 1024 * 1024 * 1024, # 20 GB
     ]
     config = {
         "file_sizes": file_sizes,

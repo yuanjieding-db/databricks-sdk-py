@@ -113,6 +113,7 @@ class Config:
     # Enable the presigned download API, which is part of the experimental files API client.
     # enable_experimental_files_api_client should be enabled to use this flag
     enable_presigned_download_api: bool = ConfigAttribute(env="DATABRICKS_ENABLE_PRESIGNED_DOWNLOAD_API")
+    files_api_client_download_streaming_chunk_size: int = 2 * 1024 * 1024  # 2 MiB
     files_api_client_download_max_total_recovers = None
     files_api_client_download_max_total_recovers_without_progressing = 1
 
