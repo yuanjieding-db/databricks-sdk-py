@@ -2,17 +2,20 @@ from tempfile import mkstemp
 from typing import Optional, BinaryIO
 
 from databricks.sdk import WorkspaceClient, FilesAPI
+from databricks.sdk.mixins.files import CreateDownloadUrlResponse
 from io import BytesIO, RawIOBase, UnsupportedOperation
 import random
+import requests
 import logging
 import time
 
 TEST_CONFIGS = {
     "GOOGFOOD": "/Volumes/users/yuanjie_ding/default",
-    "AZURE_DOGFOOD": "/Volumes/yuanjie_ding/default/python_sdk_test"
+    "AZURE_DOGFOOD": "/Volumes/yuanjie_ding/default/python_sdk_test",
+    "DOGFOOD": "/Volumes/main/default/vol1",
 }
 
-DATABRICKS_PROFILE = "GOOGFOOD"
+DATABRICKS_PROFILE = "DOGFOOD"
 TEST_VOLUME = TEST_CONFIGS[DATABRICKS_PROFILE]
 
 class Timer:
@@ -169,6 +172,13 @@ def parallel_download(w: WorkspaceClient):
     assert downloaded_content_parallel == content, "Downloaded content does not match uploaded content"
     print("Parallel download test passed successfully.")
 
+def download_logs(w: WorkspaceClient):
+    files_api = get_ext_files_api(w)
+    file_path = f"{TEST_VOLUME}/multipart-uploads-performance-test.log"
+    local_file_path = "./multipart-uploads-performance-test-remote.log"
+    files_api.download_to(file_path, destination=local_file_path, overwrite=True)
+    print(f"Downloaded logs to {local_file_path}")
+
 
 def parallel_upload(w: WorkspaceClient, parallel_mode: Optional[str] = None):
     print(f"Using parallel mode: {parallel_mode}")
@@ -189,6 +199,58 @@ def parallel_upload(w: WorkspaceClient, parallel_mode: Optional[str] = None):
     downloaded_content = files_api.download(file_path).contents.read()
     assert downloaded_content == content, "Uploaded content does not match expected content"
     print("Parallel upload test passed successfully.")
+
+def download_performance_test(w: WorkspaceClient):
+    files_api = get_ext_files_api(w)
+    file_path = f"{TEST_VOLUME}/test_download_performance.txt"
+    content_size = 5 * 1024 * 1024
+    content = get_content(content_size, 4)
+
+    print(f"Uploading file for download performance test with size {content_size/1024/1024} MB")
+    files_api.upload(file_path, BytesIO(content), overwrite=True)
+    print(f"File uploaded to {file_path}")
+
+    # Download E2E the file using the old interface
+    with Timer() as t:
+        resp = files_api.download(file_path, force_old_client=True)
+        if resp.contents is None:
+            raise ValueError("Response contents is None")
+        downloaded_content = resp.contents.read()
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
+    print(f"[E2E old client]Downloaded file in {t.interval:.2f} seconds")
+
+    # Download E2E the file using the new interface
+    with Timer() as t:
+        resp = files_api.download(file_path)
+        if resp.contents is None:
+            raise ValueError("Response contents is None")
+        downloaded_content = resp.contents.read()
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
+    print(f"[E2E new client]Downloaded file in {t.interval:.2f} seconds")
+
+    # Get the presigned URL and download the file using requests
+    with Timer() as t:
+        raw_response = files_api._api.do(
+            "POST",
+            f"/api/2.0/fs/create-download-url",
+            query={
+                "path": file_path,
+                "expire_time": files_api._get_download_url_expire_time(),
+            },
+        )
+        url_and_headers = CreateDownloadUrlResponse.from_dict(raw_response)
+    print(f"Got presigned URL in {t.interval:.2f} seconds")
+    if url_and_headers.url is None:
+        raise ValueError("Presigned URL is None")
+    print(f"Presigned URL: {url_and_headers.url}")
+    with Timer() as t:
+        response = requests.get(url_and_headers.url, headers=url_and_headers.headers)
+        response.raise_for_status()
+        downloaded_content = response.content
+    print(f"[Presigned URL]Downloaded file in {t.interval:.2f} seconds")
+    assert downloaded_content == content, "Downloaded content does not match uploaded content"
+
+    print("Download performance test passed successfully.")
 
 def new_upload_interface(w: WorkspaceClient):
     files_api = get_ext_files_api(w)
@@ -239,8 +301,10 @@ if __name__ == "__main__":
     # new_upload_interface(w)
     # multipart_upload(w)
     # new_download_interface(w)
-    parallel_download(w)
+    # parallel_download(w)
     # range_download(w)
     # parallel_upload(w, parallel_mode="subprocess")
     # single_and_multipart_upload(w)
     # download_with_presigned_url(w)
+    # download_logs(w)
+    download_performance_test(w)

@@ -793,6 +793,7 @@ class FilesExt(files.FilesAPI):
     def download(
         self,
         file_path: str,
+        force_old_client: bool = False,
     ) -> DownloadResponse:
         """Download a file.
 
@@ -808,8 +809,9 @@ class FilesExt(files.FilesAPI):
 
         :returns: :class:`DownloadResponse`
         """
-        return super().download(file_path)
-
+        if force_old_client:
+            return super().download(file_path)
+        
         initial_response: DownloadResponse = self._open_download_stream(
             file_path=file_path, start_byte_offset=0, if_unmodified_since_timestamp=None
         )
