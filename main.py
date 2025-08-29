@@ -177,7 +177,7 @@ def parallel_download(w: WorkspaceClient):
 def download_logs(w: WorkspaceClient):
     files_api = get_ext_files_api(w)
     file_path = f"{TEST_VOLUME}/multipart-uploads-performance-test.log"
-    local_file_path = "./multipart-uploads-performance-test-remote.log"
+    local_file_path = "./multipart-uploads-performance-test-remote-2.log"
     files_api.download_to(file_path, destination=local_file_path, overwrite=True)
     print(f"Downloaded logs to {local_file_path}")
 
@@ -394,5 +394,5 @@ if __name__ == "__main__":
     # parallel_upload(w, parallel_mode="subprocess")
     # single_and_multipart_upload(w)
     # download_with_presigned_url(w)
-    # download_logs(w)
-    download_performance_test(w)
+    download_logs(w)
+    # download_performance_test(w)
