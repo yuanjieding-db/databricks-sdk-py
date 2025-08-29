@@ -1178,8 +1178,9 @@ class FilesExt(files.FilesAPI):
         if not ctx.parallelism:
             ctx.parallelism = (os.cpu_count() - 1) or 1
 
+        _LOG.debug(f"Using parallel multipart upload with {ctx.parallelism} threads")
         initiate_upload_response = self._initiate_multipart_upload(ctx)
-
+        
         if initiate_upload_response.get("multipart_upload"):
             cloud_provider_session = self._create_cloud_provider_session()
             session_token = initiate_upload_response["multipart_upload"].get("session_token")
