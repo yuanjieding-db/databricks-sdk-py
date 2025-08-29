@@ -11,3 +11,5 @@ databricks-sdk-py.iml
 .databricks
 .coverage
 htmlcov
+*.csv
+*.log
