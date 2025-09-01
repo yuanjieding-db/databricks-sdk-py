@@ -730,7 +730,7 @@ class CreateDownloadUrlResponse:
 
     url: Optional[str] = None
     """The presigned URL to download the file."""
-    headers: Optional[dict[str, str]] = None
+    headers: Optional[list[dict[str, str]]] = None
     """Headers to use when making the download request."""
 
     @classmethod
@@ -2057,13 +2057,14 @@ class FilesExt(files.FilesAPI):
 
         cloud_provider_session = self._create_cloud_provider_session()
 
-        header_overlap = added_headers.keys() & url_and_headers.headers.keys()
+        returned_headers = {x["name"]: x["value"] for x in url_and_headers.headers} if url_and_headers.headers else {}
+        header_overlap = added_headers.keys() & returned_headers.keys()
         if header_overlap:
             raise ValueError(
                 f"Provided headers overlap with required headers from the CSP API bundle: {header_overlap}"
             )
 
-        merged_headers = {**url_and_headers.headers, **added_headers}
+        merged_headers = {**returned_headers, **added_headers}
 
         csp_response: _RawResponse = cloud_provider_session.request(
             "GET",
@@ -2076,7 +2077,7 @@ class FilesExt(files.FilesAPI):
         # Mapping the error if the response is not successful.
         if csp_response.status_code not in (200, 201, 206):
             message = (
-                f"Unsuccessful download. Response status: {csp_response.status_code}, body: {csp_response.content}"
+                f"Unsuccessful download. Response status: {csp_response.status_code}, body: {csp_response.content[:1000]}"
             )
             _LOG.warning(message)
             mapped_error = _error_mapper(csp_response, {})
