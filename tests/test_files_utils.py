@@ -1,7 +1,7 @@
 import logging
 import os
 from io import BytesIO, RawIOBase, UnsupportedOperation
-from typing import BinaryIO, Callable, Optional, Tuple
+from typing import BinaryIO, Callable, Optional
 import pytest
 from abc import ABC, abstractmethod
 
@@ -41,11 +41,8 @@ class NonSeekableBuffer(RawIOBase, BinaryIO):
     It is used to simulate a non-seekable stream for testing purposes.
     """
 
-    def __init__(self, data: Tuple[bytes, BytesIO]):
-        if isinstance(data, bytes):
-            self._stream = BytesIO(data)
-        else:
-            self._stream = data
+    def __init__(self, data: bytes):
+        self._stream = BytesIO(data)
 
     def read(self, size: int = -1) -> bytes:
         return self._stream.read(size)

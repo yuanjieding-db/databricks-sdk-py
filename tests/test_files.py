@@ -3053,3 +3053,60 @@ class ResumableUploadTestCase(UploadTestCase):
 )
 def test_resumable_upload(config: Config, test_case: ResumableUploadTestCase) -> None:
     test_case.run(config)
+
+
+# Test cases for CreateDownloadUrlResponse to catch typing bugs
+def test_create_download_url_response_from_dict_with_headers():
+    """Test CreateDownloadUrlResponse.from_dict() with headers present."""
+    from databricks.sdk.mixins.files import CreateDownloadUrlResponse
+
+    data = {
+        "url": "https://example.com/download",
+        "headers": [
+            {"name": "Authorization", "value": "Bearer token123"},
+            {"name": "Content-Type", "value": "application/octet-stream"},
+        ],
+    }
+
+    response = CreateDownloadUrlResponse.from_dict(data)
+
+    assert response.url == "https://example.com/download"
+    assert isinstance(response.headers, dict)
+    assert len(response.headers) == 2
+    assert response.headers["Authorization"] == "Bearer token123"
+    assert response.headers["Content-Type"] == "application/octet-stream"
+
+
+def test_create_download_url_response_from_dict_without_headers():
+    """Test CreateDownloadUrlResponse.from_dict() without headers field."""
+    from databricks.sdk.mixins.files import CreateDownloadUrlResponse
+
+    data = {"url": "https://example.com/download"}
+
+    response = CreateDownloadUrlResponse.from_dict(data)
+
+    assert response.url == "https://example.com/download"
+    assert response.headers == {}
+
+
+def test_create_download_url_response_from_dict_with_empty_headers():
+    """Test CreateDownloadUrlResponse.from_dict() with empty headers list."""
+    from databricks.sdk.mixins.files import CreateDownloadUrlResponse
+
+    data = {"url": "https://example.com/download", "headers": []}
+
+    response = CreateDownloadUrlResponse.from_dict(data)
+
+    assert response.url == "https://example.com/download"
+    assert isinstance(response.headers, dict)
+    assert len(response.headers) == 0
+
+
+def test_create_download_url_response_from_dict_missing_url():
+    """Test CreateDownloadUrlResponse.from_dict() with missing URL field."""
+    from databricks.sdk.mixins.files import CreateDownloadUrlResponse
+
+    data = {"headers": [{"name": "Content-Type", "value": "application/octet-stream"}]}
+
+    with pytest.raises(ValueError, match="Missing 'url' in response data"):
+        CreateDownloadUrlResponse.from_dict(data)

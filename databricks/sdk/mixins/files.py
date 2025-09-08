@@ -728,9 +728,9 @@ class FallbackToUploadUsingFilesApi(Exception):
 class CreateDownloadUrlResponse:
     """Response from the download URL API call."""
 
-    url: Optional[str] = None
+    url: str
     """The presigned URL to download the file."""
-    headers: Optional[list[dict[str, str]]] = None
+    headers: dict[str, str]
     """Headers to use when making the download request."""
 
     @classmethod
@@ -738,7 +738,9 @@ class CreateDownloadUrlResponse:
         """Create an instance from a dictionary."""
         if "url" not in data:
             raise ValueError("Missing 'url' in response data")
-        return cls(url=data["url"], headers=data.get("headers", {}))
+        headers = data["headers"] if "headers" in data else {}
+        parsed_headers = {x["name"]: x["value"] for x in headers}
+        return cls(url=data["url"], headers=parsed_headers)
 
 
 @dataclass
@@ -754,6 +756,7 @@ class UploadFileResult:
 
     pass
 
+
 @dataclass
 class DownloadFileResult:
     """Result of a download to file operation. Currently empty, but can be extended in the future."""
@@ -767,7 +770,7 @@ class FilesExt(files.FilesAPI):
     # note that these error codes are retryable only for idempotent operations
     _RETRYABLE_STATUS_CODES: list[int] = [408, 429, 500, 502, 503, 504]
 
-    @dataclass
+    @dataclass(frozen=True)
     class _UploadContext:
         target_path: str
         """The absolute remote path of the target file, e.g. /Volumes/path/to/your/file."""
@@ -841,7 +844,6 @@ class FilesExt(files.FilesAPI):
 
         :returns: :class:`DownloadFileResult`
         """
-        # if response.contents
         if use_parallel:
             if parallelism is None:
                 parallelism = os.cpu_count()
@@ -850,8 +852,10 @@ class FilesExt(files.FilesAPI):
             self._parallel_download(file_path, destination, overwrite=overwrite, parallelism=parallelism)
         else:
             if overwrite:
+                # If the file exists and overwrite is True, we will overwrite it.
                 open_mode = "wb"
             else:
+                # If the file exists and overwrite is False, we will raise an error.
                 open_mode = "xb"
             with open(destination, open_mode) as f:
                 response = self.download(file_path)
@@ -930,9 +934,13 @@ class FilesExt(files.FilesAPI):
                     shutil.copyfileobj(src_file, dest_file)
                 os.remove(temp_file)
 
-    def _get_optimized_performance_parameters(
-        self, ctx: _UploadContext, part_size_overwrite: Optional[int]
-    ) -> (Optional[int], Optional[int]):
+    def _get_optimized_performance_parameters_for_upload(
+        self, content_length: Optional[int], part_size_overwrite: Optional[int]
+    ) -> (int, int):
+        """Get optimized part size and batch size for upload based on content length and provided part size.
+
+        Returns tuple of (part_size, batch_size).
+        """
         chosen_part_size = None
 
         # 1. decide on the part size
@@ -944,40 +952,33 @@ class FilesExt(files.FilesAPI):
             chosen_part_size = part_size_overwrite
             _LOG.debug(f"Using provided part size: {chosen_part_size} bytes")
         else:  # If no part size is provided, we will optimize based on the content length.
-            if ctx.content_length is not None:
+            if content_length is not None:
                 # Choosing the smallest part size that allows for a maximum of 100 parts.
                 for part_size in self._config.multipart_upload_part_size_options:
-                    part_num = (ctx.content_length + part_size - 1) // part_size
+                    part_num = (content_length + part_size - 1) // part_size
                     if part_num <= 100:
                         chosen_part_size = part_size
                         _LOG.debug(
-                            f"Optimized part size for upload: {chosen_part_size} bytes for content length {ctx.content_length} bytes"
+                            f"Optimized part size for upload: {chosen_part_size} bytes for content length {content_length} bytes"
                         )
                         break
                 if chosen_part_size is None:  # If no part size was chosen, we default to the maximum allowed part size.
                     chosen_part_size = self._config.multipart_upload_max_part_size
 
+        # Use defaults if not determined yet
+        if chosen_part_size is None:
+            chosen_part_size = self._config.multipart_upload_default_part_size
+
         # 2. decide on the batch size
-        if chosen_part_size is not None:
-            part_num = (ctx.content_length + chosen_part_size - 1) // chosen_part_size
+        if content_length is not None and chosen_part_size is not None:
+            part_num = (content_length + chosen_part_size - 1) // chosen_part_size
             chosen_batch_size = int(
                 math.ceil(math.sqrt(part_num))
             )  # Using the square root of the number of parts as a heuristic for batch size.
         else:
-            chosen_batch_size = 10
+            chosen_batch_size = self._config.multipart_upload_batch_url_count
 
         return chosen_part_size, chosen_batch_size
-
-    def _optimize_context_parameters(self, ctx: _UploadContext, part_size_overwrite: Optional[int]) -> None:
-        """Optimize the upload context parameters based on the content length and provided part size."""
-
-        # Get optimized part size and batch size
-        optimized_part_size, optimized_batch_size = self._get_optimized_performance_parameters(ctx, part_size_overwrite)
-        if optimized_part_size is not None:
-            ctx.part_size = optimized_part_size
-        if optimized_batch_size is not None:
-            ctx.batch_size = optimized_batch_size
-        _LOG.debug(f"Optimized upload context: part_size={ctx.part_size}, batch_size={ctx.batch_size}")
 
     def upload(
         self, file_path: str, content: BinaryIO, *, overwrite: Optional[bool] = None, part_size: Optional[int] = None
@@ -998,22 +999,34 @@ class FilesExt(files.FilesAPI):
         """
 
         _LOG.debug(f"Uploading file from BinaryIO stream")
-        # If the content is a BinaryIO stream, we can determine if it is seekable or not.
-        ctx = self._UploadContext(
-            file_path,
-            overwrite,
-            self._config.multipart_upload_default_part_size,
-            self._config.multipart_upload_batch_url_count,
-        )
-        # Set the content length if it is known.
+
+        # Determine content length if the stream is seekable
+        content_length = None
         if content.seekable():
+            _LOG.debug(f"Uploading using seekable mode")
             # If the stream is seekable, we can read its size.
             content.seek(0, os.SEEK_END)
-            file_size = content.tell()
+            content_length = content.tell()
             content.seek(0)
-            ctx.content_length = file_size
 
-        self._optimize_context_parameters(ctx, part_size)
+        # Get optimized part size and batch size based on content length and provided part size
+        optimized_part_size, optimized_batch_size = self._get_optimized_performance_parameters_for_upload(
+            content_length, part_size
+        )
+
+        # Create context with all final parameters
+        ctx = self._UploadContext(
+            target_path=file_path,
+            overwrite=overwrite,
+            part_size=optimized_part_size,
+            batch_size=optimized_batch_size,
+            content_length=content_length,
+        )
+
+        _LOG.debug(
+            f"Upload context: part_size={ctx.part_size}, batch_size={ctx.batch_size}, content_length={ctx.content_length}"
+        )
+
         if ctx.content_length is not None:
             self._upload_single_thread_with_known_size(ctx, content)
             return UploadStreamResult()
@@ -1055,21 +1068,30 @@ class FilesExt(files.FilesAPI):
         """
 
         _LOG.debug(f"Uploading file from local path: {source_path}")
+
         if parallelism is not None and not use_parallel:
             raise ValueError("parallelism can only be set if use_parallel is True")
-        # If the content is a string, it is a path to a local file.
+        if parallelism is None and use_parallel:
+            parallelism = os.cpu_count() - 1 or 1
+        # Get the file size
         file_size = os.path.getsize(source_path)
+
+        # Get optimized part size and batch size based on content length and provided part size
+        optimized_part_size, optimized_batch_size = self._get_optimized_performance_parameters_for_upload(
+            file_size, part_size
+        )
+
+        # Create context with all final parameters
         ctx = self._UploadContext(
-            file_path,
-            overwrite,
-            self._config.multipart_upload_default_part_size,
-            self._config.multipart_upload_batch_url_count,
+            target_path=file_path,
+            overwrite=overwrite,
+            part_size=optimized_part_size,
+            batch_size=optimized_batch_size,
             content_length=file_size,
             source_file_path=source_path,
             use_parallel=use_parallel,
             parallelism=parallelism,
         )
-        self._optimize_context_parameters(ctx, part_size)
         if ctx.use_parallel:
             self._parallel_upload(ctx)
             return UploadFileResult()
@@ -1171,9 +1193,6 @@ class FilesExt(files.FilesAPI):
         This method is not implemented in this example, but it would typically
         involve creating multiple threads to upload different parts of the file concurrently.
         """
-
-        if not ctx.parallelism:
-            ctx.parallelism = (os.cpu_count() - 1) or 1
 
         initiate_upload_response = self._initiate_multipart_upload(ctx)
 
@@ -2057,14 +2076,13 @@ class FilesExt(files.FilesAPI):
 
         cloud_provider_session = self._create_cloud_provider_session()
 
-        returned_headers = {x["name"]: x["value"] for x in url_and_headers.headers} if url_and_headers.headers else {}
-        header_overlap = added_headers.keys() & returned_headers.keys()
+        header_overlap = added_headers.keys() & url_and_headers.headers.keys()
         if header_overlap:
             raise ValueError(
                 f"Provided headers overlap with required headers from the CSP API bundle: {header_overlap}"
             )
 
-        merged_headers = {**returned_headers, **added_headers}
+        merged_headers = {**added_headers, **url_and_headers.headers}
 
         csp_response: _RawResponse = cloud_provider_session.request(
             "GET",
@@ -2075,9 +2093,9 @@ class FilesExt(files.FilesAPI):
         )
 
         # Mapping the error if the response is not successful.
-        if csp_response.status_code not in (200, 201, 206):
+        if csp_response.status_code not in (200, 201):
             message = (
-                f"Unsuccessful download. Response status: {csp_response.status_code}, body: {csp_response.content[:1000]}"
+                f"Unsuccessful download. Response status: {csp_response.status_code}, body: {csp_response.content}"
             )
             _LOG.warning(message)
             mapped_error = _error_mapper(csp_response, {})
@@ -2087,7 +2105,7 @@ class FilesExt(files.FilesAPI):
             content_length=int(csp_response.headers.get("content-length")),
             content_type=csp_response.headers.get("content-type"),
             last_modified=csp_response.headers.get("last-modified"),
-            contents=_StreamingResponse(csp_response, self._config.files_api_client_download_streaming_chunk_size)
+            contents=_StreamingResponse(csp_response, self._config.files_api_client_download_streaming_chunk_size),
         )
         return resp
 
