@@ -30,7 +30,7 @@ import traceback
 from databricks.sdk import WorkspaceClient
 from typing import Optional, Tuple, BinaryIO
 from io import RawIOBase, BytesIO, UnsupportedOperation
-from requests import Session, Request, PreparedRequest
+from requests import Session, PreparedRequest
 from typing import Callable
 import json
 
@@ -38,6 +38,7 @@ import logging
 import time
 import glob
 import statistics
+import databricks.sdk
 
 
 TEST_CONFIGS = {
@@ -46,8 +47,13 @@ TEST_CONFIGS = {
     "LM": "/Volumes/users/yuanjie_ding/yuanjie_test",
 }
 
+RUNNING_IN_NOTEBOOK = "DATABRICKS_RUNTIME_VERSION" in os.environ
 DATABRICKS_PROFILE = "AZURE_DOGFOOD"
-TEST_VOLUME = TEST_CONFIGS[DATABRICKS_PROFILE]
+
+if RUNNING_IN_NOTEBOOK:
+    TEST_VOLUME = "/dbfs/yuanjie_ding/python_sdk_test"
+else:
+    TEST_VOLUME = TEST_CONFIGS[DATABRICKS_PROFILE]
 
 # Global variable to control checkpoint mechanism
 ENABLE_CHECKPOINT = True
@@ -88,13 +94,14 @@ class NonSeekableBuffer(RawIOBase, BinaryIO):
         raise UnsupportedOperation("tell not supported")
 
 
-def setup_logging():
+def setup_logging(running_in_notebook=False):
+    mode = 'w' if running_in_notebook else 'a'
     logging.basicConfig(
         filename='multipart-uploads-performance-test.log',
+        filemode=mode,
         format='%(asctime)s %(module)s %(levelname)-8s %(message)s',
         level=logging.DEBUG,
         datefmt='%Y-%m-%d %H:%M:%S')
-
     # disable unrelated logging in the notebook
     for module in ['pyspark', 'py4j', 'clientserver', 'base_comm']:
         logging.getLogger(module).setLevel(logging.ERROR)
@@ -287,7 +294,8 @@ def single_run(
             part_upload_total_time_s,
             download_duration_s
         ]
-        csv_writer.writerow(values)
+        if csv_writer is not None:
+            csv_writer.writerow(values)
 
     finally:
         if is_files_ext:
@@ -337,9 +345,14 @@ def run_series(
             except BaseException as e:
                 print(f"Run failed: {e}")
                 traceback.print_exc()
+                if csv_writer is None:
+                    # For pilot run, propagate error
+                    raise
             finally:
-                counter_pbar.update(1)
-                pbar.update(file_size)
+                if counter_pbar:
+                    counter_pbar.update(1)
+                if pbar:
+                    pbar.update(file_size)
     finally:
         os.remove(source_local_path)
 
@@ -615,12 +628,11 @@ def summary_comparison(input_file):
     print(f"Upload and download summary files generated for {input_file}")
 
 def main():
-    setup_logging()
+    setup_logging(running_in_notebook=RUNNING_IN_NOTEBOOK)
     DEFAULT_RUNS_COUNT = 3
-    running_in_notebook = "DATABRICKS_RUNTIME_VERSION" in os.environ
-    print(f"Running in notebook: {running_in_notebook}")
+    print(f"Running in notebook: {RUNNING_IN_NOTEBOOK}")
     output_file = f"./benchmark_output_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    if running_in_notebook:
+    if RUNNING_IN_NOTEBOOK:
         runs_count = DEFAULT_RUNS_COUNT
     else:
         parser = argparse.ArgumentParser()
@@ -642,10 +654,10 @@ def main():
     ]
     file_sizes = [
         # 1 * 1024 * 1024, # 1 MB
-        # 10 * 1024 * 1024, # 10 MB
+        10 * 1024 * 1024, # 10 MB
         # 20 * 1024 * 1024, # 20 MB
         # 50 * 1024 * 1024, # 50 MB
-        100 * 1024 * 1024, # 100 MB
+        # 100 * 1024 * 1024, # 100 MB
         # 200 * 1024 * 1024, # 200 MB
         # 500 * 1024 * 1024, # 500 MB
         # 1 * 1024 * 1024 * 1024, # 1 GB
@@ -654,6 +666,9 @@ def main():
         # 10 * 1024 * 1024 * 1024, # 10 GB
         # 20 * 1024 * 1024 * 1024, # 20 GB
     ]
+    run_start_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    environment_str = os.environ.get("DB_INSTANCE_TYPE", "")
+    client_version = getattr(databricks.sdk, "__version__", "")
     config = {
         "file_sizes": file_sizes,
         "source_types": source_types,
@@ -686,6 +701,11 @@ def main():
     print(f"Will be running {runs_count} runs for each file size")
     print(f"Will be running upload with parallel modes: {parallel_modes}")
     columns = [
+        "run_start_timestamp",
+        "case_start_timestamp",
+        "environment",
+        "presigned_url_type",
+        "client_version",
         "files_api_client",
         "source_type",
         "file_size",
@@ -697,6 +717,32 @@ def main():
         "part_upload_total_time_s",
         "download_time_s"
     ]
+    # PILOT RUN
+    pilot_file_size = file_sizes[0]
+    pilot_failed = False
+    for client_type in client_types:
+        w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=RUNNING_IN_NOTEBOOK)
+        for source_type in source_types:
+            for parallel_mode in parallel_modes:
+                try:
+                    run_series(
+                        w=w,
+                        counter_pbar=None,
+                        pbar=None,
+                        csv_writer=None,
+                        source_type=source_type,
+                        runs_count=1,
+                        parallel_mode=parallel_mode,
+                        file_size=pilot_file_size,
+                        volume_path=TEST_VOLUME
+                    )
+                except Exception as e:
+                    print(f"Pilot run failed for {client_type}, {source_type}, {parallel_mode}: {e}")
+                    pilot_failed = True
+    if pilot_failed:
+        import sys
+        print("Pilot run failed. Exiting.")
+        sys.exit(1)
     from tqdm import tqdm
     runs_per_file_size = len(client_types) * len(source_types) * len(parallel_modes) * runs_count
     total_size = sum(file_sizes) * runs_per_file_size
@@ -709,14 +755,13 @@ def main():
             for i_client_type, client_type in enumerate(client_types):
                 if i_client_type < start_indices["client_type"]:
                     continue
-                w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=running_in_notebook)
+                w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=RUNNING_IN_NOTEBOOK)
                 for i_source_type, source_type in enumerate(source_types):
                     if i_client_type == start_indices["client_type"] and i_source_type < start_indices["source_type"]:
                         continue
                     for i_file_size, file_size in enumerate(file_sizes):
                         if (i_client_type == start_indices["client_type"] and
-                            i_source_type == start_indices["source_type"] and
-                            i_file_size < start_indices["file_size"]):
+                            i_source_type == start_indices["source_type"] and i_file_size < start_indices["file_size"]):
                             continue
                         for i_parallel_mode, parallel_mode in enumerate(parallel_modes):
                             if (i_client_type == start_indices["client_type"] and
@@ -731,11 +776,26 @@ def main():
                                     i_parallel_mode == start_indices["parallel_mode"] and
                                     run_id < start_indices["run_id"]):
                                     continue
+                                case_start_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                presigned_url_type = ""
+                                if client_type == "FilesExt":
+                                    # Try to get presigned URL type from w.files if available
+                                    presigned_url_type = getattr(getattr(w, "files", None), "_config", None)
+                                    if presigned_url_type:
+                                        presigned_url_type = getattr(presigned_url_type, "presigned_url_type", "")
+                                # Wrap csv_writer to prepend extra columns
+                                class ExtendedWriter:
+                                    def __init__(self, writer):
+                                        self.writer = writer
+                                    def writerow(self, values):
+                                        row = [run_start_timestamp, case_start_timestamp, environment_str, presigned_url_type, client_version] + list(values)
+                                        self.writer.writerow(row)
+                                ext_writer = ExtendedWriter(csv_writer)
                                 run_series(
                                     w=w,
                                     counter_pbar=counter_pbar,
                                     pbar=pbar,
-                                    csv_writer=csv_writer,
+                                    csv_writer=ext_writer,
                                     source_type=source_type,
                                     runs_count=1,
                                     parallel_mode=parallel_mode,

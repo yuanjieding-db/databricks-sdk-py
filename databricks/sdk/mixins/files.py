@@ -2093,7 +2093,7 @@ class FilesExt(files.FilesAPI):
         )
 
         # Mapping the error if the response is not successful.
-        if csp_response.status_code not in (200, 201):
+        if csp_response.status_code not in (200, 201, 206):
             message = (
                 f"Unsuccessful download. Response status: {csp_response.status_code}, body: {csp_response.content}"
             )
