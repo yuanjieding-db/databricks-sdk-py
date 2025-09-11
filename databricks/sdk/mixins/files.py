@@ -979,6 +979,55 @@ class FilesExt(files.FilesAPI):
             chosen_batch_size = self._config.multipart_upload_batch_url_count
 
         return chosen_part_size, chosen_batch_size
+    
+    def upload_presigned_url_single_shot(
+            self, file_path: str, content: BinaryIO, *, overwrite: Optional[bool] = None
+    ):
+        _LOG.debug(f"Uploading file using presigned URL single-shot upload")
+
+        # Step 1: Get presigned URL from Files API
+        query_params: dict = {
+            "path": file_path,
+            "expiration_time": self._get_upload_url_expire_time(),
+        }
+        try:
+            upload_url_response = self._api.do(
+                "POST", f"/api/2.0/fs/create-upload-url", body=query_params
+            )
+        except Exception as e:
+            _LOG.error(f"Error occurred while getting presigned URL: {e}")
+            raise e
+        
+        presigned_url = upload_url_response.get("url")
+        required_headers = upload_url_response.get("headers", [])
+        if not presigned_url:
+            raise ValueError("Presigned URL not found in the response")
+        content_length = content.seek(0, os.SEEK_END)
+        content.seek(0)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(content_length),
+        }
+        for header in required_headers:
+            headers[header["name"]] = header["value"]
+
+        _LOG.debug(f"Uploading to presigned URL: {presigned_url} with headers: {headers}")
+
+        csp_session = self._create_cloud_provider_session()
+        def perform():
+            return csp_session.request(
+                method="PUT",
+                url=presigned_url,
+                headers=headers,
+                data=content,
+                timeout=self._config.files_ext_network_transfer_inactivity_timeout_seconds,
+            )
+        upload_response = self._retry_cloud_idempotent_operation(perform)
+        if upload_response.status_code in (200, 201):
+            _LOG.debug(f"File uploaded successfully using presigned URL single-shot upload")
+            return
+        else:
+            raise _RetryableException.make_error(upload_response)
 
     def upload(
         self, file_path: str, content: BinaryIO, *, overwrite: Optional[bool] = None, part_size: Optional[int] = None

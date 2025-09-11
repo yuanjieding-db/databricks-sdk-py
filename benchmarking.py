@@ -33,22 +33,25 @@ from io import RawIOBase, BytesIO, UnsupportedOperation
 from requests import Session, PreparedRequest
 from typing import Callable
 import json
+import tempfile
 
 import logging
 import time
 import glob
 import statistics
 import databricks.sdk
+import importlib.metadata
 
 
 TEST_CONFIGS = {
     "GOOGFOOD": "/Volumes/users/yuanjie_ding/default",
     "AZURE_DOGFOOD": "/Volumes/yuanjie_ding/default/python_sdk_test",
     "LM": "/Volumes/users/yuanjie_ding/yuanjie_test",
+    "DOGFOOD": "/Volumes/main/default/vol1",
 }
 
 RUNNING_IN_NOTEBOOK = "DATABRICKS_RUNTIME_VERSION" in os.environ
-DATABRICKS_PROFILE = "AZURE_DOGFOOD"
+DATABRICKS_PROFILE = "DOGFOOD"
 
 if RUNNING_IN_NOTEBOOK:
     TEST_VOLUME = "/dbfs/yuanjie_ding/python_sdk_test"
@@ -56,8 +59,9 @@ else:
     TEST_VOLUME = TEST_CONFIGS[DATABRICKS_PROFILE]
 
 # Global variable to control checkpoint mechanism
-ENABLE_CHECKPOINT = True
+ENABLE_CHECKPOINT = False
 CHECKPOINT_FILE = "benchmark_checkpoint.json"
+NO_TRACE_MODE = False
 
 class NonSeekableBuffer(RawIOBase, BinaryIO):
     """
@@ -186,7 +190,8 @@ def single_run(
         cleanup_cloud_file: bool = False,
         target_file_suffix: Optional[str] = None):
 
-    local_path_copy = f"{source_local_path}-copy"
+    with tempfile.NamedTemporaryFile(delete=False) as local_copy_file:
+        local_path_copy = local_copy_file.name
 
     target_remote_path = f"{volume_path}/file-{file_size}{target_file_suffix or ''}.txt"
 
@@ -208,18 +213,25 @@ def single_run(
     # let's measure how many parts we uploaded and how long did it take
     part_upload_count = 0
     part_upload_total_time_s = 0
-    def part_upload_hook(method: str, _: str, elapsed_s: int):
+    presigned_url_type = ""
+    def part_upload_hook(method: str, url: str, elapsed_s: int):
         nonlocal part_upload_count
         nonlocal part_upload_total_time_s
+        nonlocal presigned_url_type
         if method == "PUT":
             part_upload_count += 1
             part_upload_total_time_s += elapsed_s
+            if "storage-proxy.databricks" in url:
+                presigned_url_type = "DBURL"
+            elif "databricks" in url:
+                presigned_url_type = "FilesAPI"
+            else:
+                presigned_url_type = "CSPURL"
 
     is_files_ext = files_api_class(w) == "FilesExt"
     if is_files_ext:
         original_create_cloud_provider_session = w.files._create_cloud_provider_session
         w.files._create_cloud_provider_session = lambda: instrument_session(original_create_cloud_provider_session(), part_upload_hook)
-        log(f"Effective multipart upload part size: {w.files._config.multipart_upload_default_part_size} bytes")
 
     try:
         # upload file
@@ -239,6 +251,9 @@ def single_run(
             if parallel_mode == "sequential":
                 with open(source_local_path, "rb") as input_stream:
                     w.files.upload(target_remote_path, NonSeekableBuffer(input_stream), overwrite=True)
+            elif parallel_mode == "single_part":
+                with open(source_local_path, "rb") as input_stream:
+                    w.files.upload_presigned_url_single_shot(target_remote_path, input_stream, overwrite=True)
             else:
                 log("Skipping nonseekable stream upload in parallel mode")
                 return  # nonseekable stream upload is only supported in sequential mode
@@ -284,6 +299,7 @@ def single_run(
         download_duration_s = download_complete_time - upload_complete_time
         values = [
             files_api_class(w),
+            presigned_url_type,
             source_type,
             file_size,
             parallel_mode,
@@ -324,7 +340,8 @@ def run_series(
         volume_path: str,
         part_size: Optional[int] = None,
 ):
-    source_local_path = f"/tmp/file-{file_size}-{int(time.time())}.txt"
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        source_local_path = temp_file.name
     generate_random_file(source_local_path, file_size)
     try:
         for run_id in range(runs_count):
@@ -631,6 +648,7 @@ def main():
     setup_logging(running_in_notebook=RUNNING_IN_NOTEBOOK)
     DEFAULT_RUNS_COUNT = 3
     print(f"Running in notebook: {RUNNING_IN_NOTEBOOK}")
+    output_dir = "/tmp" if NO_TRACE_MODE else "."
     output_file = f"./benchmark_output_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     if RUNNING_IN_NOTEBOOK:
         runs_count = DEFAULT_RUNS_COUNT
@@ -645,12 +663,13 @@ def main():
         "FilesExt",
     ]
     parallel_modes = [
-        "parallel",
+        # "parallel",
         # "sequential",
+        "single_part",
     ]
     source_types = [
-        # "nonseekable_stream",
-        "file_path",
+        "nonseekable_stream",
+        # "file_path",
     ]
     file_sizes = [
         # 1 * 1024 * 1024, # 1 MB
@@ -668,7 +687,7 @@ def main():
     ]
     run_start_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     environment_str = os.environ.get("DB_INSTANCE_TYPE", "")
-    client_version = getattr(databricks.sdk, "__version__", "")
+    client_version = importlib.metadata.version('databricks-sdk')
     config = {
         "file_sizes": file_sizes,
         "source_types": source_types,
@@ -704,9 +723,9 @@ def main():
         "run_start_timestamp",
         "case_start_timestamp",
         "environment",
-        "presigned_url_type",
         "client_version",
         "files_api_client",
+        "presigned_url_type",
         "source_type",
         "file_size",
         "parallel_mode",
@@ -777,18 +796,12 @@ def main():
                                     run_id < start_indices["run_id"]):
                                     continue
                                 case_start_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                presigned_url_type = ""
-                                if client_type == "FilesExt":
-                                    # Try to get presigned URL type from w.files if available
-                                    presigned_url_type = getattr(getattr(w, "files", None), "_config", None)
-                                    if presigned_url_type:
-                                        presigned_url_type = getattr(presigned_url_type, "presigned_url_type", "")
                                 # Wrap csv_writer to prepend extra columns
                                 class ExtendedWriter:
                                     def __init__(self, writer):
                                         self.writer = writer
                                     def writerow(self, values):
-                                        row = [run_start_timestamp, case_start_timestamp, environment_str, presigned_url_type, client_version] + list(values)
+                                        row = [run_start_timestamp, case_start_timestamp, environment_str, client_version] + list(values)
                                         self.writer.writerow(row)
                                 ext_writer = ExtendedWriter(csv_writer)
                                 run_series(
@@ -826,6 +839,22 @@ def main():
             # Remove checkpoint file when done
             if ENABLE_CHECKPOINT and os.path.exists(CHECKPOINT_FILE):
                 os.remove(CHECKPOINT_FILE)
+        if RUNNING_IN_NOTEBOOK:
+            insert_data(csv_filename)
+            os.environ["RESULT_CSV_FILENAME"] = csv_filename
+
+def insert_data(csv_filename):
+    import pandas as pd
+    from pyspark.sql import SparkSession
+
+    # Read the CSV file into a Pandas DataFrame
+    df = pd.read_csv(csv_filename)
+
+    # Convert the Pandas DataFrame to a Spark DataFrame
+    spark_df = SparkSession.builder.getOrCreate().createDataFrame(df)
+
+    # Insert the data into the python_sdk_benchmark table
+    spark_df.write.insertInto("main.yuanjie_ding.python_sdk_benchmark")
 
 if __name__ == "__main__":
     import sys
