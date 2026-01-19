@@ -585,6 +585,9 @@ Examples:
   # Disable presigned URLs for upload only
   python3 benchmarking.py --disable-presigned-url "upload"
   
+  # Skip pilot run for faster execution
+  python3 benchmarking.py --skip-pilot
+  
   # Full example with all options
   python3 benchmarking.py --min-size 100M --max-size 10G --client "FilesExt" --parallel sequential --source_type "file_path" --runs_count 3
 
@@ -635,6 +638,9 @@ Valid values:
 
     parser.add_argument('--disable-presigned-url', type=str,
                        help='Comma-separated list of operations to disable presigned URLs for: upload, download')
+
+    parser.add_argument('--skip-pilot', action='store_true',
+                       help='Skip the pilot run and proceed directly to benchmarking')
 
     return parser.parse_args()
 
@@ -701,6 +707,7 @@ def validate_and_apply_cli_args(args):
     config['enable_checkpoint'] = not (args and args.no_checkpoint)
     config['enable_cprofile'] = args and args.enable_cprofile
     config['parallelism'] = args.parallelism if args and args.parallelism is not None else None
+    config['skip_pilot'] = args and args.skip_pilot
     
     # Parse disable_presigned_url
     default_operations = ["upload", "download"]
@@ -730,7 +737,8 @@ def benchmark_sdk(
     no_checkpoint=False,
     enable_cprofile=False,
     parallelism=None,
-    disable_presigned_url=None
+    disable_presigned_url=None,
+    skip_pilot=False
 ):
     setup_logging(running_in_notebook=RUNNING_IN_NOTEBOOK)
 
@@ -751,6 +759,7 @@ def benchmark_sdk(
     args.enable_cprofile = enable_cprofile
     args.parallelism = parallelism
     args.disable_presigned_url = disable_presigned_url
+    args.skip_pilot = skip_pilot
 
     config = validate_and_apply_cli_args(args)
 
@@ -840,39 +849,42 @@ def benchmark_sdk(
     ]
     
     # PILOT RUN
-    print("PILOT running")
-    pilot_file_size = file_sizes[0]
-    pilot_failed = False
-    for client_type in client_types:
-        w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=RUNNING_IN_NOTEBOOK)
-        # Apply presigned URL disable patch if configured
-        if config.get('disable_presigned_url'):
-            apply_presigned_url_disable_patch(w, config['disable_presigned_url'])
-        for source_type in source_types:
-            for parallel_mode in parallel_modes:
-                try:
-                    print(f"Running pilot for {client_type}, {source_type}, {parallel_mode}")
-                    run_series(
-                        config,
-                        w=w,
-                        counter_pbar=None,
-                        pbar=None,
-                        csv_writer=None,
-                        source_type=source_type,
-                        runs_count=1,
-                        parallel_mode=parallel_mode,
-                        file_size=pilot_file_size,
-                        volume_path=TEST_VOLUME
-                    )
-                    print(f"Passed")
-                except Exception as e:
-                    print(f"Pilot run failed for {client_type}, {source_type}, {parallel_mode} with size {pilot_file_size}: {e}")
-                    pilot_failed = True
-    
-    if pilot_failed:
-        import sys
-        print("Pilot run failed. Exiting.")
-        sys.exit(1)
+    if not config.get('skip_pilot', False):
+        print("PILOT running")
+        pilot_file_size = file_sizes[0]
+        pilot_failed = False
+        for client_type in client_types:
+            w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=RUNNING_IN_NOTEBOOK)
+            # Apply presigned URL disable patch if configured
+            if config.get('disable_presigned_url'):
+                apply_presigned_url_disable_patch(w, config['disable_presigned_url'])
+            for source_type in source_types:
+                for parallel_mode in parallel_modes:
+                    try:
+                        print(f"Running pilot for {client_type}, {source_type}, {parallel_mode}")
+                        run_series(
+                            config,
+                            w=w,
+                            counter_pbar=None,
+                            pbar=None,
+                            csv_writer=None,
+                            source_type=source_type,
+                            runs_count=1,
+                            parallel_mode=parallel_mode,
+                            file_size=pilot_file_size,
+                            volume_path=TEST_VOLUME
+                        )
+                        print(f"Passed")
+                    except Exception as e:
+                        print(f"Pilot run failed for {client_type}, {source_type}, {parallel_mode} with size {pilot_file_size}: {e}")
+                        pilot_failed = True
+        
+        if pilot_failed:
+            import sys
+            print("Pilot run failed. Exiting.")
+            sys.exit(1)
+    else:
+        print("Skipping pilot run as requested")
     from tqdm import tqdm
     runs_per_file_size = len(client_types) * len(source_types) * len(parallel_modes) * runs_count
     total_size = sum(file_sizes) * runs_per_file_size
@@ -997,5 +1009,6 @@ if __name__ == "__main__":
         no_checkpoint=getattr(args, "no_checkpoint", False),
         enable_cprofile=getattr(args, "enable_cprofile", False),
         parallelism=getattr(args, "parallelism", None),
-        disable_presigned_url=getattr(args, "disable_presigned_url", None)
+        disable_presigned_url=getattr(args, "disable_presigned_url", None),
+        skip_pilot=getattr(args, "skip_pilot", False)
     )
