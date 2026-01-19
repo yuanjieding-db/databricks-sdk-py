@@ -159,6 +159,36 @@ def instrument_session(session: Session, hook: Callable[[str, str, int], None]):
     session.hooks['response'] = [response_hook]
     return session
 
+def apply_presigned_url_disable_patch(w: WorkspaceClient, disable_operations: list):
+    """
+    Monkey-patch the FilesExt client to disable presigned URLs for specified operations.
+    This wraps the _api.do() method to intercept presigned URL creation requests.
+    """
+    from databricks.sdk.mixins.files import FallbackToUploadUsingFilesApi, FallbackToDownloadUsingFilesApi
+    
+    original_do = w.files._api.do
+    
+    def patched_do(method, path, *args, **kwargs):
+        # Intercept upload presigned URL requests
+        if "upload" in disable_operations:
+            if "create-upload-part-urls" in path or "create-resumable-upload-url" in path:
+                raise FallbackToUploadUsingFilesApi(
+                    None,
+                    f"Presigned URL disabled for upload via --disable-presigned-url"
+                )
+        
+        # Intercept download presigned URL requests
+        if "download" in disable_operations:
+            if "create-download-url" in path:
+                raise FallbackToDownloadUsingFilesApi(
+                    f"Presigned URL disabled for download via --disable-presigned-url"
+                )
+        
+        # Call original method for all other requests
+        return original_do(method, path, *args, **kwargs)
+    
+    w.files._api.do = patched_do
+
 def save_checkpoint(state):
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(state, f)
@@ -549,6 +579,12 @@ Examples:
   # Run with specific source type and custom runs
   python3 benchmarking.py --source_type file_path --runs_count 5
   
+  # Disable presigned URLs for both upload and download
+  python3 benchmarking.py --disable-presigned-url "upload,download"
+  
+  # Disable presigned URLs for upload only
+  python3 benchmarking.py --disable-presigned-url "upload"
+  
   # Full example with all options
   python3 benchmarking.py --min-size 100M --max-size 10G --client "FilesExt" --parallel sequential --source_type "file_path" --runs_count 3
 
@@ -562,6 +598,7 @@ Valid values:
   client: FilesAPI, FilesExt
   parallel: sequential, parallel
   source_type: nonseekable_stream, file_path
+  disable_presigned_url: upload, download
   size units: B, K/KB, M/MB, G/GB, T/TB (case insensitive)
         ''')
     
@@ -595,6 +632,9 @@ Valid values:
 
     # Parallelism argument
     parser.add_argument('--parallelism', type=int, default=None, help='Parallelism for upload and download. If not set, None will be passed.')
+
+    parser.add_argument('--disable-presigned-url', type=str,
+                       help='Comma-separated list of operations to disable presigned URLs for: upload, download')
 
     return parser.parse_args()
 
@@ -662,6 +702,18 @@ def validate_and_apply_cli_args(args):
     config['enable_cprofile'] = args and args.enable_cprofile
     config['parallelism'] = args.parallelism if args and args.parallelism is not None else None
     
+    # Parse disable_presigned_url
+    default_operations = ["upload", "download"]
+    if args and args.disable_presigned_url:
+        disable_operations = parse_list_arg(
+            args.disable_presigned_url, 
+            default_operations, 
+            "disable_presigned_url"
+        )
+    else:
+        disable_operations = None
+    config['disable_presigned_url'] = disable_operations
+    
     return config
 
 
@@ -677,7 +729,8 @@ def benchmark_sdk(
     output=None,
     no_checkpoint=False,
     enable_cprofile=False,
-    parallelism=None
+    parallelism=None,
+    disable_presigned_url=None
 ):
     setup_logging(running_in_notebook=RUNNING_IN_NOTEBOOK)
 
@@ -697,6 +750,7 @@ def benchmark_sdk(
     args.no_checkpoint = no_checkpoint
     args.enable_cprofile = enable_cprofile
     args.parallelism = parallelism
+    args.disable_presigned_url = disable_presigned_url
 
     config = validate_and_apply_cli_args(args)
 
@@ -791,6 +845,9 @@ def benchmark_sdk(
     pilot_failed = False
     for client_type in client_types:
         w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=RUNNING_IN_NOTEBOOK)
+        # Apply presigned URL disable patch if configured
+        if config.get('disable_presigned_url'):
+            apply_presigned_url_disable_patch(w, config['disable_presigned_url'])
         for source_type in source_types:
             for parallel_mode in parallel_modes:
                 try:
@@ -830,6 +887,9 @@ def benchmark_sdk(
                 if i_client_type < start_indices["client_type"]:
                     continue
                 w = get_workspace_client(enable_new_client=(client_type == "FilesExt"), running_in_notebook=RUNNING_IN_NOTEBOOK)
+                # Apply presigned URL disable patch if configured
+                if config.get('disable_presigned_url'):
+                    apply_presigned_url_disable_patch(w, config['disable_presigned_url'])
                 
                 for i_source_type, source_type in enumerate(source_types):
                     if i_client_type == start_indices["client_type"] and i_source_type < start_indices["source_type"]:
@@ -936,5 +996,6 @@ if __name__ == "__main__":
         output=getattr(args, "output", None),
         no_checkpoint=getattr(args, "no_checkpoint", False),
         enable_cprofile=getattr(args, "enable_cprofile", False),
-        parallelism=getattr(args, "parallelism", None)
+        parallelism=getattr(args, "parallelism", None),
+        disable_presigned_url=getattr(args, "disable_presigned_url", None)
     )
